@@ -1,0 +1,11 @@
+{
+  "name": "Daily Budget — Where did my money go?",
+  "short_name": "Daily Budget",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0b0b17",
+  "theme_color": "#0b0b17",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

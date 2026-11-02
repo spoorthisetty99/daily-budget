@@ -1,0 +1,706 @@
+'use strict';
+
+/* ================= Storage ================= */
+
+const STORE_KEY = 'daily-budget-v1';
+
+const DEFAULT_STATE = {
+  settings: {
+    income: 0,
+    rollover: true,          // underspend today → higher budget tomorrow
+    reminderTime: '21:00',   // nightly "how did you do" notification
+    notify: false,
+    startDate: null,         // first day tracking started (YYYY-MM-DD)
+  },
+  txns: [],                  // { id, date: 'YYYY-MM-DD', time, name, category, method, amount }
+  lastSummary: null,         // date key of the last night-summary sent
+};
+
+function load() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORE_KEY));
+    if (raw) return { ...DEFAULT_STATE, ...raw, settings: { ...DEFAULT_STATE.settings, ...raw.settings } };
+  } catch { /* fall through to defaults */ }
+  return structuredClone(DEFAULT_STATE);
+}
+
+let state = load();
+const save = () => localStorage.setItem(STORE_KEY, JSON.stringify(state));
+
+/* ================= Dates & money ================= */
+
+const pad = (n) => String(n).padStart(2, '0');
+const keyOf = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const parseKey = (k) => { const [y, m, d] = k.split('-').map(Number); return new Date(y, m - 1, d); };
+const todayKey = () => keyOf(new Date());
+const addDays = (k, n) => { const d = parseKey(k); d.setDate(d.getDate() + n); return keyOf(d); };
+const daysInMonth = (k) => { const d = parseKey(k); return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate(); };
+const monthStart = (k) => k.slice(0, 8) + '01';
+const monthEnd = (k) => k.slice(0, 8) + pad(daysInMonth(k));
+const daysBetween = (a, b) => Math.round((parseKey(b) - parseKey(a)) / 86400000);
+
+const inr = (n) => '₹' + Math.round(Math.abs(n)).toLocaleString('en-IN');
+
+/* ================= Budget engine ================= */
+
+const baseDaily = (k) => state.settings.income / daysInMonth(k);
+
+const spentOn = (k) => state.txns.filter((t) => t.date === k).reduce((s, t) => s + t.amount, 0);
+
+const spentBetween = (from, toExclusive) =>
+  state.txns.filter((t) => t.date >= from && t.date < toExclusive).reduce((s, t) => s + t.amount, 0);
+
+/**
+ * Today's allowance.
+ * Without rollover it's simply income ÷ days in the month.
+ * With rollover, whatever is left of this month's money (since tracking started)
+ * is spread evenly over the days left — so a good day raises tomorrow's budget
+ * and a bad day lowers it.
+ */
+function budgetFor(k) {
+  const base = baseDaily(k);
+  if (!state.settings.rollover) return base;
+  const start = [monthStart(k), state.settings.startDate || k].sort().pop();
+  if (k <= start) return base;
+  const trackedDays = daysBetween(start, monthEnd(k)) + 1;
+  const daysLeft = daysBetween(k, monthEnd(k)) + 1;
+  const left = base * trackedDays - spentBetween(start, k);
+  return Math.max(0, left / daysLeft);
+}
+
+function stateColor(remaining, budget) {
+  if (budget <= 0 || remaining <= 0) return 'var(--red)';
+  const r = remaining / budget;
+  if (r > 0.5) return 'var(--green)';
+  if (r > 0.2) return 'var(--yellow)';
+  return 'var(--red)';
+}
+
+/* ================= Categories ================= */
+
+const ICONS = {
+  cup: '<path d="M5 8h11v6a5 5 0 0 1-5 5h-1a5 5 0 0 1-5-5V8Z"/><path d="M16 10h2a2 2 0 0 1 0 4h-2"/><path d="M9 3v2M12 3v2"/>',
+  bag: '<path d="M5 8h14l-1 12H6L5 8Z"/><path d="M9 8V6a3 3 0 0 1 6 0v2"/>',
+  scooter: '<circle cx="6" cy="17" r="2.5"/><circle cx="18" cy="17" r="2.5"/><path d="M8.5 17h7M15 6h2l1 8M6 14.5 9 9h5"/>',
+  car: '<path d="M4 16V12l2-5h12l2 5v4"/><path d="M3 16h18"/><circle cx="7.5" cy="17.5" r="1.5"/><circle cx="16.5" cy="17.5" r="1.5"/>',
+  bolt: '<path d="M13 3 5 14h6l-1 7 8-11h-6l1-7Z"/>',
+  repeat: '<path d="M17 2l3 3-3 3"/><path d="M4 11V9a4 4 0 0 1 4-4h12"/><path d="M7 22l-3-3 3-3"/><path d="M20 13v2a4 4 0 0 1-4 4H4"/>',
+  film: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M8 5v14M16 5v14"/>',
+  heart: '<path d="M12 20s-7-4.5-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.5-7 10-7 10Z"/>',
+  shirt: '<path d="M8 4 4 7l2 4 2-1v10h8V10l2 1 2-4-4-3a4 4 0 0 1-8 0Z"/>',
+  dot: '<circle cx="12" cy="12" r="4"/>',
+};
+
+const CATEGORIES = {
+  'Food & drink':  'cup',
+  'Groceries':     'bag',
+  'Shopping':      'shirt',
+  'Transport':     'car',
+  'Bills':         'bolt',
+  'Subscriptions': 'repeat',
+  'Entertainment': 'film',
+  'Health':        'heart',
+  'Other':         'dot',
+};
+
+const icon = (cat, name = '') => {
+  const key = /zepto|swiggy instamart/i.test(name) ? 'scooter' : CATEGORIES[cat] || 'dot';
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[key]}</svg>`;
+};
+
+// Merchant keyword → category, used for quick-add and SMS auto-detection.
+const MERCHANTS = [
+  [/zepto|blinkit|bigbasket|instamart|dmart|jiomart|grocer|kirana|more retail/i, 'Groceries'],
+  [/swiggy|zomato|starbucks|coffee|cafe|chai|tea|dominos|pizza|kfc|mcdonald|restaurant|bakery/i, 'Food & drink'],
+  [/netflix|spotify|prime|hotstar|youtube|apple|icloud|google one|jio ?cinema|sonyliv|zee5|gym|cult/i, 'Subscriptions'],
+  [/uber|ola|rapido|metro|irctc|petrol|fuel|indian oil|hpcl|bpcl|shell|fastag|redbus/i, 'Transport'],
+  [/electric|bescom|tata power|airtel|jio|vi |vodafone|broadband|recharge|gas|water|rent/i, 'Bills'],
+  [/amazon|flipkart|myntra|ajio|nykaa|meesho|decathlon|zara|h&m/i, 'Shopping'],
+  [/bookmyshow|pvr|inox|steam|playstation/i, 'Entertainment'],
+  [/pharma|apollo|medplus|1mg|pharmeasy|hospital|clinic|doctor/i, 'Health'],
+];
+
+const guessCategory = (name) => (MERCHANTS.find(([re]) => re.test(name)) || [, 'Other'])[1];
+
+const QUICK_ADD = [
+  { name: 'Coffee', category: 'Food & drink', amount: 250 },
+  { name: 'Blinkit', category: 'Groceries', amount: 600 },
+  { name: 'Zepto', category: 'Groceries', amount: 400 },
+  { name: 'Swiggy', category: 'Food & drink', amount: 450 },
+  { name: 'Uber', category: 'Transport', amount: 300 },
+  { name: 'Chai', category: 'Food & drink', amount: 30 },
+];
+
+/* ================= SMS / UPI parser ================= */
+
+/**
+ * Pulls amount + merchant from typical Indian bank / UPI alerts, e.g.
+ *  "Rs.250.00 debited from A/c XX1234 on 02-11-26 to VPA starbucks@hdfcbank (UPI Ref 1234)"
+ *  "You have paid ₹600 to BLINKIT via UPI"
+ *  "INR 1,250.00 spent on your Card XX12 at ZEPTO on 2026-11-02"
+ */
+function parseSms(text) {
+  if (!/debited|paid|spent|sent|withdrawn|purchase|txn|payment of/i.test(text)) return null;
+  if (/credited to your|received from|refund/i.test(text) && !/debited/i.test(text)) return null;
+  const amt = text.match(/(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)/i);
+  if (!amt) return null;
+  const amount = parseFloat(amt[1].replace(/,/g, ''));
+  let name = '';
+  const vpa = text.match(/(?:vpa|upi id)\s*:?\s*([\w.\-]+)@[\w.]+/i);
+  const to = text.match(/\b(?:to|at|towards)\s+(?:vpa\s+)?([A-Za-z][\w&' .\-]{1,40}?)(?=\s+(?:on|via|ref|upi|using|from|for|avl|a\/c|\.|$)|[.,(]|@)/i);
+  if (to) name = to[1];
+  else if (vpa) name = vpa[1];
+  name = name.replace(/[._\-]+/g, ' ').replace(/\s+/g, ' ').trim() || 'UPI payment';
+  name = name.length > 22 ? name.slice(0, 22) : name;
+  const method = /card/i.test(text) ? 'Card' : /atm|withdrawn/i.test(text) ? 'Cash' : 'UPI';
+  return { name: titleCase(name), amount, method, category: guessCategory(name) };
+}
+
+const titleCase = (s) => s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+
+/* ================= Mutations ================= */
+
+function addTxn({ name, category, amount, method = 'UPI', date = todayKey() }) {
+  amount = Number(amount);
+  if (!name || !(amount > 0)) return false;
+  const now = new Date();
+  state.txns.push({
+    id: crypto.randomUUID?.() || String(Date.now() + Math.random()),
+    date,
+    time: `${pad(now.getHours())}:${pad(now.getMinutes())}`,
+    name: name.trim(),
+    category: category || guessCategory(name),
+    method,
+    amount,
+  });
+  save();
+  return true;
+}
+
+function deleteTxn(id) {
+  state.txns = state.txns.filter((t) => t.id !== id);
+  save();
+}
+
+/* ================= Rendering ================= */
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const view = $('#view');
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+let tab = 'today';
+
+function render() {
+  document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  $('#fab').style.display = tab === 'settings' ? 'none' : '';
+  if (!state.settings.income) return renderOnboarding();
+  ({ today: renderToday, month: renderMonth, insights: renderInsights, settings: renderSettings })[tab]();
+}
+
+function txnHtml(t) {
+  return `
+    <div class="txn">
+      <div class="ico">${icon(t.category, t.name)}</div>
+      <div class="meta">
+        <div class="name">${esc(t.name)}</div>
+        <div class="cat">${esc(t.category)} · ${esc(t.method)}</div>
+      </div>
+      <div class="amt">−${inr(t.amount)}</div>
+      <button class="del" data-del="${t.id}" aria-label="Delete">×</button>
+    </div>`;
+}
+
+function renderToday() {
+  const k = todayKey();
+  const budget = budgetFor(k);
+  const spent = spentOn(k);
+  const remaining = budget - spent;
+  const color = stateColor(remaining, budget);
+  const pct = budget > 0 ? Math.max(0, Math.min(100, (remaining / budget) * 100)) : 0;
+  const day = parseKey(k).getDate();
+  const txns = state.txns.filter((t) => t.date === k).reverse();
+  const tomorrow = previewTomorrow(k);
+
+  view.innerHTML = `
+    <section class="card" style="--state:${color}">
+      <div class="budget-head">
+        <span class="label">Today's budget</span>
+        <span class="pill">DAY ${day}</span>
+      </div>
+      <div class="budget-row">
+        <div class="big">${remaining < 0 ? '−' : ''}${inr(remaining)}</div>
+        <div class="spent">
+          <div class="label">Spent</div>
+          <div class="amt">${spent ? '−' : ''}${inr(spent)}</div>
+        </div>
+      </div>
+      <div class="bar"><span style="width:${pct}%"></span></div>
+      <div class="sub">
+        ${remaining < 0
+          ? `Over by ${inr(-remaining)} · daily allowance ${inr(budget)}`
+          : `of ${inr(budget)} today · ${inr(state.settings.income)} ÷ ${daysInMonth(k)} days${state.settings.rollover && Math.round(budget) !== Math.round(baseDaily(k)) ? ' (adjusted)' : ''}`}
+      </div>
+    </section>
+
+    ${nightSummaryCard(k)}
+
+    <div class="label section-title">Quick add</div>
+    <div class="quick">
+      ${QUICK_ADD.map((q, i) => `<button class="chip" data-quick="${i}">${q.name} <b>${inr(q.amount)}</b></button>`).join('')}
+      <button class="chip" data-action="sms">📩 Paste SMS</button>
+    </div>
+
+    <div class="label section-title">Today's transactions</div>
+    <div class="txn-list">
+      ${txns.length ? txns.map(txnHtml).join('') : '<div class="empty">No spends yet. Easy.</div>'}
+    </div>
+
+    ${state.settings.rollover && daysBetween(k, monthEnd(k)) > 0 ? `
+      <p class="sub" style="text-align:center;margin-top:18px">
+        If you stop here, tomorrow's budget is <b style="color:var(--text)">${inr(tomorrow)}</b>
+      </p>` : ''}
+  `;
+}
+
+function previewTomorrow(k) {
+  const t = addDays(k, 1);
+  if (monthStart(t) !== monthStart(k)) return baseDaily(t);
+  return budgetFor(t);
+}
+
+function summaryFor(k) {
+  const budget = budgetFor(k);
+  const spent = spentOn(k);
+  const good = spent <= budget;
+  const tomorrow = previewTomorrow(k);
+  const title = good ? 'Good day 💚' : 'Bad day 😬';
+  const body = good
+    ? `You spent ${inr(spent)} of your ${inr(budget)} budget. Saved ${inr(budget - spent)}${state.settings.rollover ? ` — tomorrow you get ${inr(tomorrow)}.` : '.'}`
+    : `You spent ${inr(spent)} vs your ${inr(budget)} budget — ${inr(spent - budget)} over${state.settings.rollover ? `. Tomorrow's budget drops to ${inr(tomorrow)}.` : '.'}`;
+  return { good, title, body };
+}
+
+function nightSummaryCard(k) {
+  const [h, m] = state.settings.reminderTime.split(':').map(Number);
+  const now = new Date();
+  if (now.getHours() * 60 + now.getMinutes() < h * 60 + m) return '';
+  const s = summaryFor(k);
+  return `
+    <section class="card summary ${s.good ? 'good' : 'bad'}">
+      <div class="emoji">${s.good ? '🌙' : '🫠'}</div>
+      <div><strong>${s.title}</strong><p>${s.body}</p></div>
+    </section>`;
+}
+
+function renderMonth() {
+  const k = todayKey();
+  const first = parseKey(monthStart(k));
+  const n = daysInMonth(k);
+  const lead = (first.getDay() + 6) % 7; // Monday-first
+  const monthSpent = spentBetween(monthStart(k), addDays(monthEnd(k), 1));
+  const left = state.settings.income - monthSpent;
+  let good = 0, bad = 0;
+
+  const cells = [];
+  for (let i = 0; i < lead; i++) cells.push('<div class="day blank"></div>');
+  for (let d = 1; d <= n; d++) {
+    const dk = k.slice(0, 8) + pad(d);
+    const spent = spentOn(dk);
+    const tracked = !state.settings.startDate || dk >= state.settings.startDate;
+    let cls = 'day';
+    if (dk === k) cls += ' today';
+    if (dk > k) cls += ' future';
+    else if (tracked && dk < k) {
+      if (spent <= budgetFor(dk)) { cls += ' good'; good++; } else { cls += ' bad'; bad++; }
+    }
+    const short = (n) => (n >= 10000 ? '₹' + (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'k' : inr(n));
+    const label = dk > k ? short(dk === addDays(k, 1) ? previewTomorrow(k) : budgetFor(k)) : spent ? short(spent) : dk < k && tracked ? '₹0' : '';
+    cells.push(`<div class="${cls}" title="${dk}"><span class="n">${d}</span><span class="s">${label}</span></div>`);
+  }
+
+  view.innerHTML = `
+    <div class="stats">
+      <div class="card stat"><div class="label">Spent this month</div><div class="v red">${inr(monthSpent)}</div></div>
+      <div class="card stat"><div class="label">Left to spend</div><div class="v ${left >= 0 ? 'green' : 'red'}">${left < 0 ? '−' : ''}${inr(left)}</div></div>
+      <div class="card stat"><div class="label">Good days</div><div class="v green">${good}</div></div>
+      <div class="card stat"><div class="label">Bad days</div><div class="v red">${bad}</div></div>
+    </div>
+    <section class="card">
+      <div class="label" style="margin-bottom:12px">${first.toLocaleString('en-IN', { month: 'long', year: 'numeric' })}</div>
+      <div class="cal">
+        ${['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((d) => `<div class="dow">${d}</div>`).join('')}
+        ${cells.join('')}
+      </div>
+      <p class="sub">Past days show what you spent (green = within budget). Future days show the projected allowance.</p>
+    </section>
+  `;
+}
+
+let insightRange = 'month';
+
+function renderInsights() {
+  const k = todayKey();
+  const from = insightRange === 'week' ? addDays(k, -6) : insightRange === 'month' ? monthStart(k) : '0000-00-00';
+  const txns = state.txns.filter((t) => t.date >= from && t.date <= k);
+  const total = txns.reduce((s, t) => s + t.amount, 0);
+
+  const byCat = {};
+  const byMerchant = {};
+  for (const t of txns) {
+    byCat[t.category] = (byCat[t.category] || 0) + t.amount;
+    const m = t.name.toLowerCase();
+    byMerchant[m] = byMerchant[m] || { name: t.name, total: 0, count: 0 };
+    byMerchant[m].total += t.amount;
+    byMerchant[m].count++;
+  }
+  const cats = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
+  const top = Object.values(byMerchant).sort((a, b) => b.total - a.total).slice(0, 5);
+  const subs = detectSubscriptions();
+  const subsTotal = subs.reduce((s, x) => s + x.amount, 0);
+
+  view.innerHTML = `
+    <div class="segmented">
+      ${[['week', '7 days'], ['month', 'This month'], ['all', 'All time']].map(([v, l]) =>
+        `<button data-range="${v}" class="${insightRange === v ? 'on' : ''}">${l}</button>`).join('')}
+    </div>
+
+    <section class="card">
+      <div class="label">Where your money went</div>
+      <div class="big" style="font-size:40px;margin:8px 0 4px;--state:var(--text);text-shadow:none">${inr(total)}</div>
+      <div class="sub" style="margin-top:0">${txns.length} transactions</div>
+      ${cats.length ? cats.map(([c, v]) => `
+        <div class="cat-row">
+          <div class="top"><span>${esc(c)}</span><span>${inr(v)} · ${Math.round((v / total) * 100)}%</span></div>
+          <div class="bar"><span style="width:${(v / cats[0][1]) * 100}%"></span></div>
+        </div>`).join('') : '<div class="empty">Nothing logged yet.</div>'}
+    </section>
+
+    <div class="label section-title">Subscriptions you pay for</div>
+    <section class="card">
+      ${subs.length ? `
+        ${subs.map((s) => `<div class="sub-row"><span>${esc(s.name)} <small style="color:var(--muted)">${s.reason}</small></span><span class="r">${inr(s.amount)}/mo</span></div>`).join('')}
+        <div class="sub-row"><b>Total</b><span class="r">${inr(subsTotal)}/mo · ${inr(subsTotal * 12)}/yr</span></div>`
+        : '<div class="empty" style="padding:12px 0">No subscriptions spotted yet. Log one under “Subscriptions”, or it will be detected when the same merchant charges you in two different months.</div>'}
+    </section>
+
+    <div class="label section-title">Top merchants</div>
+    <div class="txn-list">
+      ${top.map((m) => `
+        <div class="txn">
+          <div class="ico">${icon(guessCategory(m.name), m.name)}</div>
+          <div class="meta"><div class="name">${esc(m.name)}</div><div class="cat">${m.count} × · avg ${inr(m.total / m.count)}</div></div>
+          <div class="amt">−${inr(m.total)}</div>
+        </div>`).join('') || '<div class="empty">—</div>'}
+    </div>
+  `;
+}
+
+/** Explicit "Subscriptions" category, or the same merchant charging a similar amount in 2+ months. */
+function detectSubscriptions() {
+  const groups = {};
+  for (const t of state.txns) {
+    const key = t.name.toLowerCase();
+    (groups[key] = groups[key] || []).push(t);
+  }
+  const out = [];
+  for (const list of Object.values(groups)) {
+    const latest = list.reduce((a, b) => (a.date > b.date ? a : b));
+    if (list.some((t) => t.category === 'Subscriptions')) {
+      out.push({ name: latest.name, amount: latest.amount, reason: '' });
+      continue;
+    }
+    if (latest.category === 'Bills') continue; // rent, electricity etc. recur but aren't subscriptions
+    const months = new Set(list.map((t) => t.date.slice(0, 7)));
+    const amounts = list.map((t) => t.amount);
+    const similar = Math.max(...amounts) <= Math.min(...amounts) * 1.1;
+    if (months.size >= 2 && similar && list.length <= months.size + 1) {
+      out.push({ name: latest.name, amount: latest.amount, reason: '· recurring' });
+    }
+  }
+  return out.sort((a, b) => b.amount - a.amount);
+}
+
+function renderSettings() {
+  const s = state.settings;
+  const perm = 'Notification' in window ? Notification.permission : 'unsupported';
+  view.innerHTML = `
+    <section class="card">
+      <form id="settings-form">
+        <div class="field">
+          <label class="label" for="income">Monthly income (₹)</label>
+          <input id="income" name="income" type="number" inputmode="numeric" min="1" value="${s.income}" required />
+        </div>
+        <label class="toggle">
+          <span>Roll over savings<small>Spend less today → bigger budget tomorrow (and vice-versa).</small></span>
+          <input type="checkbox" name="rollover" ${s.rollover ? 'checked' : ''} />
+        </label>
+        <label class="toggle">
+          <span>Nightly summary<small>${perm === 'denied' ? 'Notifications are blocked in your browser settings.' : perm === 'unsupported' ? 'This browser has no notifications — the summary still shows on the Today tab.' : '“Good day / bad day” notification at the time below.'}</small></span>
+          <input type="checkbox" name="notify" ${s.notify && perm === 'granted' ? 'checked' : ''} ${perm === 'unsupported' || perm === 'denied' ? 'disabled' : ''} />
+        </label>
+        <div class="field">
+          <label class="label" for="reminderTime">Summary time</label>
+          <input id="reminderTime" name="reminderTime" type="time" value="${s.reminderTime}" />
+        </div>
+        <button class="btn" type="submit">Save</button>
+      </form>
+    </section>
+
+    <div class="label section-title">Data</div>
+    <section class="card">
+      <button class="btn ghost" data-action="test-notify">Send me tonight's summary now</button>
+      <button class="btn ghost" data-action="export">Export CSV</button>
+      <button class="btn ghost" data-action="demo">Load demo data</button>
+      <button class="btn danger" data-action="reset">Erase everything</button>
+    </section>
+    <p class="sub" style="text-align:center">Everything stays on this device (localStorage).</p>
+  `;
+}
+
+function renderOnboarding() {
+  $('#fab').style.display = 'none';
+  view.innerHTML = `
+    <section class="card">
+      <div class="label">Step 1</div>
+      <h2 style="font-size:24px;font-weight:900;margin:8px 0 6px">How much comes in every month?</h2>
+      <p class="sub" style="margin-top:0">We split it into a daily allowance. ₹1,00,000 ÷ 30 ≈ ₹3,333 a day — every single day.</p>
+      <form id="onboard-form" style="margin-top:16px">
+        <div class="field">
+          <input name="income" type="number" inputmode="numeric" min="1" placeholder="e.g. 100000" required autofocus />
+        </div>
+        <button class="btn" type="submit">Show my daily budget</button>
+      </form>
+    </section>
+  `;
+}
+
+/* ================= Sheets (dialogs) ================= */
+
+const sheet = $('#sheet');
+
+function openAddSheet(prefill = {}) {
+  sheet.innerHTML = `
+    <form method="dialog" id="add-form">
+      <h2>Add a spend</h2>
+      <div class="field">
+        <label class="label" for="a-amount">Amount (₹)</label>
+        <input id="a-amount" name="amount" type="number" inputmode="decimal" min="1" step="any" value="${prefill.amount ?? ''}" required />
+      </div>
+      <div class="field">
+        <label class="label" for="a-name">Where</label>
+        <input id="a-name" name="name" maxlength="40" placeholder="Coffee, Blinkit, Uber…" value="${esc(prefill.name ?? '')}" required />
+      </div>
+      <div class="row">
+        <div class="field">
+          <label class="label" for="a-cat">Category</label>
+          <select id="a-cat" name="category">
+            ${Object.keys(CATEGORIES).map((c) => `<option ${c === (prefill.category || 'Food & drink') ? 'selected' : ''}>${c}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field">
+          <label class="label" for="a-method">Paid via</label>
+          <select id="a-method" name="method">
+            ${['UPI', 'Card', 'Cash', 'Net banking'].map((m) => `<option ${m === (prefill.method || 'UPI') ? 'selected' : ''}>${m}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label class="label" for="a-date">Date</label>
+        <input id="a-date" name="date" type="date" value="${prefill.date || todayKey()}" max="${todayKey()}" />
+      </div>
+      <button class="btn" value="save">Add</button>
+      <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
+    </form>`;
+  const name = $('#a-name', sheet);
+  const cat = $('#a-cat', sheet);
+  name.addEventListener('input', () => {
+    const g = guessCategory(name.value);
+    if (g !== 'Other') cat.value = g;
+  });
+  sheet.showModal();
+  (prefill.amount ? name : $('#a-amount', sheet)).focus();
+}
+
+function openSmsSheet() {
+  sheet.innerHTML = `
+    <form method="dialog" id="sms-form">
+      <h2>Paste a bank / UPI SMS</h2>
+      <p class="hint">We'll pull out the amount and merchant. Works with most HDFC, ICICI, SBI, Axis, GPay, PhonePe and Paytm alerts. Paste several at once, one per line.</p>
+      <div class="field">
+        <textarea name="sms" placeholder="Rs.250.00 debited from A/c XX1234 to VPA starbucks@hdfcbank on 02-11-26. UPI Ref 6312…" required></textarea>
+      </div>
+      <button class="btn" value="parse">Add spends</button>
+      <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
+    </form>`;
+  sheet.showModal();
+}
+
+sheet.addEventListener('close', () => {
+  const form = sheet.querySelector('form');
+  if (!form || sheet.returnValue === 'cancel' || !sheet.returnValue) return;
+  const data = Object.fromEntries(new FormData(form));
+  if (form.id === 'add-form') {
+    if (addTxn(data)) { toast(`−${inr(data.amount)} · ${data.name}`); render(); }
+  } else if (form.id === 'sms-form') {
+    const lines = data.sms.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+    const parsed = lines.map(parseSms).filter(Boolean);
+    parsed.forEach((p) => addTxn(p));
+    toast(parsed.length ? `Added ${parsed.length} spend${parsed.length > 1 ? 's' : ''} · ${inr(parsed.reduce((s, p) => s + p.amount, 0))}` : "Couldn't find a debit in that message");
+    render();
+  }
+  sheet.returnValue = '';
+});
+
+/* ================= Notifications ================= */
+
+let swReg = null;
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  navigator.serviceWorker.register('sw.js').then((r) => (swReg = r)).catch(() => {});
+}
+
+async function notify(title, body) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return toast(`${title} — ${body}`);
+  const opts = { body, icon: 'icon.svg', badge: 'icon.svg', tag: 'daily-summary' };
+  if (swReg) swReg.showNotification(title, opts);
+  else new Notification(title, opts);
+}
+
+function checkNightly() {
+  const s = state.settings;
+  if (!s.income || !s.notify) return;
+  const k = todayKey();
+  if (state.lastSummary === k) return;
+  const [h, m] = s.reminderTime.split(':').map(Number);
+  const now = new Date();
+  if (now.getHours() * 60 + now.getMinutes() < h * 60 + m) return;
+  const sum = summaryFor(k);
+  notify(sum.title, sum.body);
+  state.lastSummary = k;
+  save();
+}
+setInterval(checkNightly, 30_000);
+
+/* ================= Misc ================= */
+
+let toastTimer;
+function toast(msg) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+function exportCsv() {
+  const rows = [['date', 'time', 'name', 'category', 'method', 'amount']]
+    .concat(state.txns.map((t) => [t.date, t.time, t.name, t.category, t.method, t.amount]));
+  const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = `expenses-${todayKey()}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function loadDemo() {
+  const k = todayKey();
+  const day = parseKey(k).getDate();
+  const pool = [
+    ['Coffee', 'Food & drink', 250], ['Blinkit', 'Groceries', 600], ['Zepto', 'Groceries', 400],
+    ['Swiggy', 'Food & drink', 520], ['Uber', 'Transport', 340], ['Amazon', 'Shopping', 1899],
+    ['Chai', 'Food & drink', 40], ['Bookmyshow', 'Entertainment', 700], ['Apollo Pharmacy', 'Health', 320],
+  ];
+  state.settings.income = state.settings.income || 100000;
+  state.settings.startDate = addDays(k, -40);
+  state.txns = [];
+  const rand = (n) => Math.floor(Math.random() * n);
+  for (let i = 40; i >= 1; i--) {
+    const d = addDays(k, -i);
+    const n = 1 + rand(4);
+    for (let j = 0; j < n; j++) {
+      const [name, category, amount] = pool[rand(pool.length)];
+      addTxn({ name, category, amount: Math.round(amount * (0.8 + Math.random() * 0.5)), date: d });
+    }
+    if (parseKey(d).getDate() === 5) {
+      addTxn({ name: 'Netflix', category: 'Subscriptions', amount: 649, method: 'Card', date: d });
+      addTxn({ name: 'Spotify', category: 'Subscriptions', amount: 119, method: 'UPI', date: d });
+    }
+    if (parseKey(d).getDate() === 1) addTxn({ name: 'Rent', category: 'Bills', amount: 25000, method: 'Net banking', date: d });
+  }
+  if (day > 1) addTxn({ name: 'Coffee', category: 'Food & drink', amount: 250 });
+  save();
+}
+
+/* ================= Events ================= */
+
+document.querySelector('.tabs').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-tab]');
+  if (!b) return;
+  tab = b.dataset.tab;
+  render();
+  window.scrollTo({ top: 0 });
+});
+
+$('#fab').addEventListener('click', () => openAddSheet());
+
+view.addEventListener('click', async (e) => {
+  const t = e.target.closest('button');
+  if (!t) return;
+  if (t.dataset.quick) {
+    const q = QUICK_ADD[t.dataset.quick];
+    addTxn(q);
+    toast(`−${inr(q.amount)} · ${q.name}`);
+    render();
+  } else if (t.dataset.del) {
+    deleteTxn(t.dataset.del);
+    render();
+  } else if (t.dataset.range) {
+    insightRange = t.dataset.range;
+    render();
+  } else if (t.dataset.action === 'sms') openSmsSheet();
+  else if (t.dataset.action === 'export') exportCsv();
+  else if (t.dataset.action === 'demo') {
+    if (!state.txns.length || confirm('Replace your transactions with ~40 days of demo data?')) { loadDemo(); toast('Demo data loaded'); tab = 'today'; render(); }
+  } else if (t.dataset.action === 'reset') {
+    if (confirm('Erase all settings and transactions on this device?')) { localStorage.removeItem(STORE_KEY); state = load(); tab = 'today'; render(); }
+  } else if (t.dataset.action === 'test-notify') {
+    if ('Notification' in window && Notification.permission === 'default') await Notification.requestPermission();
+    const s = summaryFor(todayKey());
+    notify(s.title, s.body);
+  }
+});
+
+view.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const data = Object.fromEntries(new FormData(e.target));
+  if (e.target.id === 'onboard-form') {
+    state.settings.income = Number(data.income);
+    state.settings.startDate = todayKey();
+    save();
+    tab = 'today';
+    render();
+  } else if (e.target.id === 'settings-form') {
+    const s = state.settings;
+    s.income = Number(data.income) || s.income;
+    s.rollover = !!data.rollover;
+    s.reminderTime = data.reminderTime || '21:00';
+    s.notify = !!data.notify;
+    if (s.notify && 'Notification' in window && Notification.permission === 'default') {
+      s.notify = (await Notification.requestPermission()) === 'granted';
+    }
+    save();
+    toast('Saved');
+    render();
+  }
+});
+
+// Re-render when the day rolls over or the tab becomes visible again.
+let lastKey = todayKey();
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  checkNightly();
+  if (todayKey() !== lastKey) { lastKey = todayKey(); render(); }
+});
+
+render();
+checkNightly();
