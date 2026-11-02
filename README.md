@@ -45,7 +45,9 @@ iOS doesn't let any app read your messages, but a **Shortcuts automation** can p
 
 1. Shortcuts → Automation → **+** → **Message** → *Message Contains* `debited` → **Run Immediately**.
 2. Actions: **URL Encode** (Shortcut Input → Content) → **Open URLs** `https://<where-the-app-is-hosted>/#sms=<URL Encoded Text>`.
-3. Repeat with the **Email** trigger (subject contains `debited` or sender is your bank) using the email Body.
+3. Banks word alerts differently (HDFC UPI: `Sent Rs.…`, cards: `spent`), so make one automation per wording:
+   `debited`, `Sent Rs`, `spent`.
+4. Repeat with the **Email** trigger (subject contains `debited` or sender is your bank) using the email Body.
 
 The text travels in the URL fragment (`#…`), which browsers never send to the server. It's parsed on the phone.
 Balances ("Avl Bal Rs …") are ignored, credits are skipped, and the same message is never counted twice.

@@ -519,6 +519,7 @@ function renderSettings() {
       <ol>
         <li>Open <b>Shortcuts</b> → <b>Automation</b> → <b>+</b> → <b>Message</b>.</li>
         <li><b>Message Contains</b>: <code>debited</code> → choose <b>Run Immediately</b> → Next → <b>New Blank Automation</b>.</li>
+        <li>Banks word alerts differently (HDFC UPI says <code>Sent Rs.</code>, cards say <code>spent</code>), so repeat steps 1–4 for each wording your bank uses: <code>debited</code>, <code>Sent Rs</code>, <code>spent</code>.</li>
         <li>Add <b>URL Encode</b>, input = <b>Shortcut Input</b> (tap it and pick the message <b>Content</b>).</li>
         <li>Add <b>Open URLs</b> with the link above, then insert the <b>URL Encoded Text</b> variable right after <code>#sms=</code>.</li>
         <li>For bank emails do the same with the <b>Email</b> trigger (Subject contains <code>debited</code>, or Sender is your bank's alert address), picking the email's <b>Body</b>.</li>
