@@ -202,6 +202,12 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .sub-row:last-child { border-bottom: 0; }
 .sub-row .r { color: var(--red); font-weight: 700; }
 
+/* ---- Fixed costs ---- */
+.fixed-maths { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; font-size: 14px; }
+.fixed-maths > div { display: flex; justify-content: space-between; padding: 4px 0; color: var(--muted); }
+.fixed-maths .total { color: var(--text); font-weight: 700; border-top: 1px dashed var(--line); margin-top: 4px; padding-top: 8px; }
+.fixed-maths .green { color: var(--green); font-weight: 800; }
+
 /* ---- iPhone guide ---- */
 .guide ol { margin: 4px 0 12px; padding-left: 20px; font-size: 14px; line-height: 1.55; }
 .guide li { margin-bottom: 6px; }

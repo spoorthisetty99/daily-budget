@@ -16,6 +16,9 @@ which goes green → yellow → red as it drains. At night you get a
 - **Paste a bank/UPI SMS** — amount and merchant are extracted automatically and the category is guessed
   (Zepto/Blinkit → Groceries, Swiggy/Starbucks → Food & drink, Netflix/Spotify → Subscriptions, …).
   Paste several messages at once, one per line.
+- **Fixed monthly costs** (Settings) — rent, SIP, EMI… are set aside first: the daily budget is
+  (income − fixed costs) ÷ days. When one is paid, its spend is tagged **Fixed** (automatically if the
+  alert's name matches) and doesn't count against that day.
 - **Rollover** (toggle) — what's left of the month is spread over the remaining days, so underspending
   raises tomorrow's budget and overspending lowers it.
 - **Nightly summary** — browser notification at a time you choose, e.g.

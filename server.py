@@ -32,7 +32,8 @@ LOCK = threading.Lock()
 STATIC = {'/', '/index.html', '/styles.css', '/app.js', '/sw.js', '/manifest.webmanifest',
           '/icon.svg', '/apple-touch-icon.png'}
 
-DEFAULT_SETTINGS = {'income': 0, 'rollover': True, 'reminderTime': '21:00', 'notify': False, 'startDate': None}
+DEFAULT_SETTINGS = {'income': 0, 'rollover': True, 'reminderTime': '21:00', 'notify': False, 'startDate': None,
+                    'fixed': []}
 
 
 # ================= Storage =================
@@ -97,16 +98,22 @@ def inr(n):
 
 # ================= Budget engine (mirrors app.js) =================
 
+# "Fixed" spends (rent, SIP…) were set aside up front, so they don't eat the daily budget.
 def spent_on(s, k):
-    return sum(t['amount'] for t in s['txns'] if t['date'] == k)
+    return sum(t['amount'] for t in s['txns'] if t['date'] == k and t.get('category') != 'Fixed')
 
 
 def spent_between(s, start, end_exclusive):
-    return sum(t['amount'] for t in s['txns'] if start <= t['date'] < end_exclusive)
+    return sum(t['amount'] for t in s['txns']
+               if start <= t['date'] < end_exclusive and t.get('category') != 'Fixed')
+
+
+def fixed_total(s):
+    return sum(float(f.get('amount') or 0) for f in s['settings'].get('fixed') or [])
 
 
 def base_daily(s, k):
-    return s['settings']['income'] / days_in_month(k)
+    return max(0, s['settings']['income'] - fixed_total(s)) / days_in_month(k)
 
 
 def budget_for(s, k):
@@ -169,7 +176,20 @@ MERCHANTS = [
 MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
 
 
-def guess_category(name):
+def is_fixed_name(name, fixed):
+    n = str(name).lower().strip()
+    if len(n) < 3:
+        return False
+    for f in fixed or []:
+        fn = str(f.get('name', '')).lower().strip()
+        if len(fn) >= 3 and (fn in n or n in fn):
+            return True
+    return False
+
+
+def guess_category(name, fixed=()):
+    if is_fixed_name(name, fixed):
+        return 'Fixed'
     return next((c for pat, c in MERCHANTS if re.search(pat, name, re.I)), 'Other')
 
 
@@ -202,7 +222,7 @@ def date_in_text(text):
     return t
 
 
-def parse_sms(text):
+def parse_sms(text, fixed=()):
     text = re.sub(r'\s+', ' ', str(text)).strip()
     if not DEBIT.search(text):
         return None
@@ -227,7 +247,7 @@ def parse_sms(text):
         'name': title_case(name),
         'amount': int(amount) if amount.is_integer() else amount,
         'method': method,
-        'category': guess_category(name),
+        'category': guess_category(name, fixed),
         'date': date_in_text(text),
     }
 
@@ -254,7 +274,7 @@ def add_from_sms(text):
         fp = fingerprint(text)
         if fp in s['seenSms']:
             return 'Already added this one.'
-        p = parse_sms(text)
+        p = parse_sms(text, s['settings'].get('fixed'))
         if not p:
             return 'No debit found in that message, nothing added.'
         s['txns'].append({
@@ -277,6 +297,8 @@ def add_from_sms(text):
         if p['date'] != k:
             d = pkey(p['date'])
             line += f" ({d.day} {d.strftime('%b')})"
+        if p['category'] == 'Fixed':
+            return f'{line}\nFixed cost, already set aside. Daily budget unchanged.'
         left = budget_for(s, k) - spent_on(s, k)
         status = f'{inr(left)} left today' if left >= 0 else f"{inr(-left)} over today's budget"
         return f'{line}\n{status}'

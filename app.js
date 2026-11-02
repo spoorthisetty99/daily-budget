@@ -11,6 +11,7 @@ const DEFAULT_STATE = {
     reminderTime: '21:00',   // nightly "how did you do" notification
     notify: false,
     startDate: null,         // first day tracking started (YYYY-MM-DD)
+    fixed: [],               // fixed monthly costs: { id, name, amount }
   },
   txns: [],                  // { id, date: 'YYYY-MM-DD', time, name, category, method, amount }
   lastSummary: null,         // date key of the last night-summary sent
@@ -147,12 +148,18 @@ const shortDate = (k) => parseKey(k).toLocaleDateString('en-IN', { day: 'numeric
 
 /* ================= Budget engine ================= */
 
-const baseDaily = (k) => state.settings.income / daysInMonth(k);
+// Fixed monthly costs (rent, SIP, EMI…) are set aside first; the rest is split across the days.
+const fixedTotal = () => (state.settings.fixed || []).reduce((s, f) => s + Number(f.amount || 0), 0);
+const spendable = () => Math.max(0, state.settings.income - fixedTotal());
+const baseDaily = (k) => spendable() / daysInMonth(k);
 
-const spentOn = (k) => state.txns.filter((t) => t.date === k).reduce((s, t) => s + t.amount, 0);
+// Spends in the "Fixed" category were already set aside, so they don't eat the daily budget.
+const counts = (t) => t.category !== 'Fixed';
+
+const spentOn = (k) => state.txns.filter((t) => t.date === k && counts(t)).reduce((s, t) => s + t.amount, 0);
 
 const spentBetween = (from, toExclusive) =>
-  state.txns.filter((t) => t.date >= from && t.date < toExclusive).reduce((s, t) => s + t.amount, 0);
+  state.txns.filter((t) => t.date >= from && t.date < toExclusive && counts(t)).reduce((s, t) => s + t.amount, 0);
 
 /**
  * Today's allowance.
@@ -193,6 +200,7 @@ const ICONS = {
   heart: '<path d="M12 20s-7-4.5-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.5-7 10-7 10Z"/>',
   shirt: '<path d="M8 4 4 7l2 4 2-1v10h8V10l2 1 2-4-4-3a4 4 0 0 1-8 0Z"/>',
   dot: '<circle cx="12" cy="12" r="4"/>',
+  home: '<path d="M4 11 12 4l8 7"/><path d="M6 10v10h12V10"/><path d="M10 20v-5h4v5"/>',
 };
 
 const CATEGORIES = {
@@ -204,6 +212,7 @@ const CATEGORIES = {
   'Subscriptions': 'repeat',
   'Entertainment': 'film',
   'Health':        'heart',
+  'Fixed':         'home', // rent, SIP, EMI: set aside up front, not counted against the day
   'Other':         'dot',
 };
 
@@ -224,7 +233,17 @@ const MERCHANTS = [
   [/pharma|apollo|medplus|1mg|pharmeasy|hospital|clinic|doctor/i, 'Health'],
 ];
 
-const guessCategory = (name) => (MERCHANTS.find(([re]) => re.test(name)) || [, 'Other'])[1];
+/** A spend named like one of your fixed costs ("Rent", "Axis SIP"…) is that fixed cost being paid. */
+const isFixedName = (name, fixed = state.settings.fixed || []) => {
+  const n = String(name).toLowerCase().trim();
+  return n.length >= 3 && fixed.some((f) => {
+    const fn = String(f.name).toLowerCase().trim();
+    return fn.length >= 3 && (n.includes(fn) || fn.includes(n));
+  });
+};
+
+const guessCategory = (name) =>
+  isFixedName(name) ? 'Fixed' : (MERCHANTS.find(([re]) => re.test(name)) || [, 'Other'])[1];
 
 const QUICK_ADD = [
   { name: 'Coffee', category: 'Food & drink', amount: 250 },
@@ -394,7 +413,7 @@ function txnHtml(t) {
       <div class="ico">${icon(t.category, t.name)}</div>
       <div class="meta">
         <div class="name">${esc(t.name)}</div>
-        <div class="cat">${esc(t.category)} · ${esc(t.method)}</div>
+        <div class="cat">${esc(t.category)}${t.category === 'Fixed' ? ' (set aside)' : ''} · ${esc(t.method)}</div>
         ${t.note ? `<div class="note">${esc(t.note)}</div>` : ''}
       </div>
       <div class="amt">−${inr(t.amount)}</div>
@@ -430,7 +449,7 @@ function renderToday() {
       <div class="sub">
         ${remaining < 0
           ? `Over by ${inr(-remaining)} · daily allowance ${inr(budget)}`
-          : `of ${inr(budget)} today · ${inr(state.settings.income)} ÷ ${daysInMonth(k)} days${state.settings.rollover && Math.round(budget) !== Math.round(baseDaily(k)) ? ' (adjusted)' : ''}`}
+          : `of ${inr(budget)} today · ${fixedTotal() ? `(${inr(state.settings.income)} − ${inr(fixedTotal())} fixed)` : inr(state.settings.income)} ÷ ${daysInMonth(k)} days${state.settings.rollover && Math.round(budget) !== Math.round(baseDaily(k)) ? ' (adjusted)' : ''}`}
       </div>
     </section>
 
@@ -490,7 +509,7 @@ function renderMonth() {
   const n = daysInMonth(k);
   const lead = (first.getDay() + 6) % 7; // Monday-first
   const monthSpent = spentBetween(monthStart(k), addDays(monthEnd(k), 1));
-  const left = state.settings.income - monthSpent;
+  const left = spendable() - monthSpent; // fixed costs are already set aside
   let good = 0, bad = 0;
 
   const cells = [];
@@ -602,7 +621,7 @@ function detectSubscriptions() {
       out.push({ name: latest.name, amount: latest.amount, reason: '' });
       continue;
     }
-    if (latest.category === 'Bills') continue; // rent, electricity etc. recur but aren't subscriptions
+    if (latest.category === 'Bills' || latest.category === 'Fixed') continue; // rent, EMIs etc. recur but aren't subscriptions
     const months = new Set(list.map((t) => t.date.slice(0, 7)));
     const amounts = list.map((t) => t.amount);
     const similar = Math.max(...amounts) <= Math.min(...amounts) * 1.1;
@@ -611,6 +630,66 @@ function detectSubscriptions() {
     }
   }
   return out.sort((a, b) => b.amount - a.amount);
+}
+
+function fixedSection() {
+  const fixed = state.settings.fixed || [];
+  const k = todayKey();
+  return `
+    <div class="label section-title">Fixed monthly costs</div>
+    <section class="card">
+      <p class="sub" style="margin-top:0">Rent, SIP, EMI, insurance… set aside before your daily budget is worked out. When one is paid, its spend is tagged <b>Fixed</b> and doesn't count against that day.</p>
+      <div class="txn-list" style="margin:12px 0">
+        ${fixed.map((f) => `
+          <div class="txn editable" data-fixed="${f.id}" role="button" tabindex="0" aria-label="Edit ${esc(f.name)}">
+            <div class="ico">${icon('Fixed')}</div>
+            <div class="meta"><div class="name">${esc(f.name)}</div><div class="cat">every month</div></div>
+            <div class="amt" style="color:var(--text)">${inr(f.amount)}</div>
+          </div>`).join('') || '<div class="empty" style="padding:8px 0">No fixed costs yet.</div>'}
+      </div>
+      <button class="btn ghost" data-action="add-fixed">+ Add a fixed cost</button>
+      <div class="fixed-maths">
+        <div><span>Monthly income</span><span>${inr(state.settings.income)}</span></div>
+        <div><span>Fixed costs</span><span>− ${inr(fixedTotal())}</span></div>
+        <div class="total"><span>Left for daily spending</span><span>${inr(spendable())}</span></div>
+        <div><span>÷ ${daysInMonth(k)} days</span><span class="green">${inr(baseDaily(k))} / day</span></div>
+      </div>
+    </section>`;
+}
+
+function openFixedSheet(f = {}) {
+  sheet.innerHTML = `
+    <form method="dialog" id="fixed-form" data-id="${f.id || ''}">
+      <h2>${f.id ? 'Edit fixed cost' : 'Add a fixed cost'}</h2>
+      <div class="field">
+        <label class="label" for="f-name">Name</label>
+        <input id="f-name" name="name" maxlength="40" placeholder="Rent, SIP, Car EMI…" value="${esc(f.name ?? '')}" required />
+      </div>
+      <div class="field">
+        <label class="label" for="f-amount">Amount per month (₹)</label>
+        <input id="f-amount" name="amount" type="number" inputmode="numeric" min="1" step="any" value="${f.amount ?? ''}" required />
+      </div>
+      <p class="hint">Name it the way your bank alert does (e.g. the landlord's name, or “SIP”), so that payment is tagged Fixed automatically.</p>
+      <button class="btn" value="save">${f.id ? 'Save' : 'Add'}</button>
+      ${f.id ? '<button class="btn danger" value="delete" formnovalidate>Remove</button>' : ''}
+      <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
+    </form>`;
+  showSheet();
+  if (!f.id) $('#f-name', sheet).focus();
+}
+
+function saveFixed(id, data, remove) {
+  let fixed = [...(state.settings.fixed || [])];
+  if (remove) fixed = fixed.filter((f) => f.id !== id);
+  else {
+    const amount = Number(data.amount);
+    if (!data.name?.trim() || !(amount > 0)) return false;
+    const item = { id: id || String(Date.now()), name: data.name.trim(), amount };
+    fixed = id ? fixed.map((f) => (f.id === id ? item : f)) : [...fixed, item];
+  }
+  state.settings.fixed = fixed;
+  save({ type: 'settings', settings: { fixed } });
+  return true;
 }
 
 function renderSettings() {
@@ -638,6 +717,8 @@ function renderSettings() {
         <button class="btn" type="submit">Save</button>
       </form>
     </section>
+
+    ${fixedSection()}
 
     ${serverMode ? serverGuide() : ''}
 
@@ -849,6 +930,10 @@ function handleSheet(form, value) {
   const data = Object.fromEntries(new FormData(form));
   if (form.id === 'add-form') {
     if (addTxn(data)) { toast(`−${inr(data.amount)} · ${data.name}`); render(); }
+  } else if (form.id === 'fixed-form') {
+    const removed = value === 'delete';
+    if (saveFixed(form.dataset.id, data, removed)) toast(removed ? 'Fixed cost removed' : `Saved · daily budget now ${inr(budgetFor(todayKey()))}`);
+    render();
   } else if (form.id === 'edit-form') {
     if (value === 'delete') { deleteTxn(form.dataset.id); toast('Spend deleted'); }
     else if (updateTxn(form.dataset.id, data)) toast('Saved');
@@ -995,6 +1080,8 @@ view.addEventListener('click', async (e) => {
   const t = e.target.closest('button');
   const row = e.target.closest('[data-edit]');
   if (row && !t) return openAddSheet(state.txns.find((x) => x.id === row.dataset.edit));
+  const fixedRow = e.target.closest('[data-fixed]');
+  if (fixedRow) return openFixedSheet((state.settings.fixed || []).find((f) => f.id === fixedRow.dataset.fixed));
   const cell = e.target.closest('[data-day]');
   if (cell) return openDaySheet(cell.dataset.day);
   if (!t) return;
@@ -1011,6 +1098,7 @@ view.addEventListener('click', async (e) => {
     render();
   } else if (t.dataset.action === 'sms') openSmsSheet();
   else if (t.dataset.action === 'export') exportCsv();
+  else if (t.dataset.action === 'add-fixed') openFixedSheet();
   else if (t.dataset.action === 'copy-link' || t.dataset.action === 'copy') {
     const input = $('#' + (t.dataset.copy || 'sms-link'));
     try { await navigator.clipboard.writeText(input.value); toast('Copied'); } catch {
