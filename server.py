@@ -291,6 +291,10 @@ def apply_ops(ops):
                 t = op['txn']
                 if not any(x['id'] == t['id'] for x in s['txns']):
                     s['txns'].append(t)
+            elif kind == 'update':
+                for x in s['txns']:
+                    if x['id'] == op['id']:
+                        x.update(op['changes'])
             elif kind == 'delete':
                 s['txns'] = [x for x in s['txns'] if x['id'] != op['id']]
             elif kind == 'settings':
@@ -405,4 +409,7 @@ if __name__ == '__main__':
     print(f'  On your iPhone (same Wi-Fi): http://{ip}:{PORT}')
     print(f'  Shortcut URL for alerts:     http://{ip}:{PORT}/api/sms')
     print(f'  Shortcut URL for summary:    http://{ip}:{PORT}/api/summary')
-    ThreadingHTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
+    try:
+        ThreadingHTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        print('Stopped.')

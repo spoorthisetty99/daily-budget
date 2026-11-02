@@ -29,7 +29,7 @@ let state = load();
 
 /**
  * Saves locally, and queues `ops` for the PC server (server.py) when there is one.
- * Ops: {type:'add', txn} · {type:'delete', id} · {type:'settings', settings} · {type:'seen', fp} · {type:'replace', state}
+ * Ops: {type:'add', txn} · {type:'delete', id} · {type:'update', id, changes} · {type:'settings', settings} · {type:'seen', fp} · {type:'replace', state}
  */
 function save(...ops) {
   localStorage.setItem(STORE_KEY, JSON.stringify(state));
@@ -321,7 +321,7 @@ const titleCase = (s) => s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()
 
 /* ================= Mutations ================= */
 
-function addTxn({ name, category, amount, method = 'UPI', date = todayKey() }) {
+function addTxn({ name, category, amount, method = 'UPI', date = todayKey(), note = '' }) {
   amount = Number(amount);
   if (!name || !(amount > 0)) return false;
   const ops = [];
@@ -339,6 +339,7 @@ function addTxn({ name, category, amount, method = 'UPI', date = todayKey() }) {
     category: category || guessCategory(name),
     method,
     amount,
+    ...(note.trim() ? { note: note.trim() } : {}),
   };
   state.txns.push(txn);
   save(...ops, { type: 'add', txn });
@@ -348,6 +349,28 @@ function addTxn({ name, category, amount, method = 'UPI', date = todayKey() }) {
 function deleteTxn(id) {
   state.txns = state.txns.filter((t) => t.id !== id);
   save({ type: 'delete', id });
+}
+
+function updateTxn(id, data) {
+  const t = state.txns.find((x) => x.id === id);
+  const amount = Number(data.amount);
+  if (!t || !data.name?.trim() || !(amount > 0)) return false;
+  const changes = {
+    amount,
+    name: data.name.trim(),
+    category: data.category,
+    method: data.method,
+    date: data.date || t.date,
+    note: (data.note || '').trim(),
+  };
+  Object.assign(t, changes);
+  const ops = [];
+  if (state.settings.startDate && changes.date < state.settings.startDate) {
+    state.settings.startDate = changes.date;
+    ops.push({ type: 'settings', settings: { startDate: changes.date } });
+  }
+  save(...ops, { type: 'update', id, changes });
+  return true;
 }
 
 /* ================= Rendering ================= */
@@ -367,11 +390,12 @@ function render() {
 
 function txnHtml(t) {
   return `
-    <div class="txn">
+    <div class="txn editable" data-edit="${t.id}" role="button" tabindex="0" aria-label="Edit ${esc(t.name)}">
       <div class="ico">${icon(t.category, t.name)}</div>
       <div class="meta">
         <div class="name">${esc(t.name)}</div>
         <div class="cat">${esc(t.category)} · ${esc(t.method)}</div>
+        ${t.note ? `<div class="note">${esc(t.note)}</div>` : ''}
       </div>
       <div class="amt">−${inr(t.amount)}</div>
       <button class="del" data-del="${t.id}" aria-label="Delete">×</button>
@@ -483,7 +507,8 @@ function renderMonth() {
     }
     const short = (n) => (n >= 10000 ? '₹' + (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'k' : inr(n));
     const label = dk > k ? short(dk === addDays(k, 1) ? previewTomorrow(k) : budgetFor(k)) : spent ? short(spent) : dk < k && tracked ? '₹0' : '';
-    cells.push(`<div class="${cls}" title="${dk}"><span class="n">${d}</span><span class="s">${label}</span></div>`);
+    const tap = dk <= k ? ` data-day="${dk}" role="button" aria-label="Spends on ${shortDate(dk)}"` : '';
+    cells.push(`<div class="${cls}" title="${dk}"${tap}><span class="n">${d}</span><span class="s">${label}</span></div>`);
   }
 
   view.innerHTML = `
@@ -711,10 +736,14 @@ function renderOnboarding() {
 
 const sheet = $('#sheet');
 
-function openAddSheet(prefill = {}) {
+const showSheet = () => sheet.open || sheet.showModal();
+
+/** Add form, or with `prefill.id` the edit form. `day` returns to that day's list afterwards. */
+function openAddSheet(prefill = {}, { day } = {}) {
+  const editing = !!prefill.id;
   sheet.innerHTML = `
-    <form method="dialog" id="add-form">
-      <h2>Add a spend</h2>
+    <form method="dialog" id="${editing ? 'edit-form' : 'add-form'}" data-id="${prefill.id || ''}" data-day="${day || ''}">
+      <h2>${editing ? 'Edit spend' : 'Add a spend'}</h2>
       <div class="field">
         <label class="label" for="a-amount">Amount (₹)</label>
         <input id="a-amount" name="amount" type="number" inputmode="decimal" min="1" step="any" value="${prefill.amount ?? ''}" required />
@@ -741,7 +770,12 @@ function openAddSheet(prefill = {}) {
         <label class="label" for="a-date">Date</label>
         <input id="a-date" name="date" type="date" value="${prefill.date || todayKey()}" max="${todayKey()}" />
       </div>
-      <button class="btn" value="save">Add</button>
+      <div class="field">
+        <label class="label" for="a-note">Note</label>
+        <textarea id="a-note" name="note" maxlength="200" rows="2" placeholder="Optional, e.g. groceries for the week">${esc(prefill.note ?? '')}</textarea>
+      </div>
+      <button class="btn" value="save">${editing ? 'Save' : 'Add'}</button>
+      ${editing ? '<button class="btn danger" value="delete" formnovalidate>Delete spend</button>' : ''}
       <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
     </form>`;
   const name = $('#a-name', sheet);
@@ -750,9 +784,42 @@ function openAddSheet(prefill = {}) {
     const g = guessCategory(name.value);
     if (g !== 'Other') cat.value = g;
   });
-  sheet.showModal();
-  (prefill.amount ? name : $('#a-amount', sheet)).focus();
+  showSheet();
+  if (!editing) (prefill.amount ? name : $('#a-amount', sheet)).focus();
 }
+
+/** Everything spent on one day, from a tap on the Month calendar. */
+function openDaySheet(k) {
+  const txns = state.txns.filter((t) => t.date === k).sort((a, b) => (b.time || '').localeCompare(a.time || ''));
+  const spent = spentOn(k);
+  const budget = budgetFor(k);
+  const verdict = k === todayKey() ? 'so far today' : spent <= budget ? '· good day 💚' : '· over budget 😬';
+  sheet.innerHTML = `
+    <form method="dialog" id="day-form" data-day="${k}">
+      <h2>${parseKey(k).toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' })}</h2>
+      <p class="hint">Spent <b style="color:var(--text)">${inr(spent)}</b> of ${inr(budget)} ${verdict}</p>
+      <div class="txn-list day-list">
+        ${txns.length ? txns.map(txnHtml).join('') : '<div class="empty">No spends on this day.</div>'}
+      </div>
+      <button class="btn" type="button" data-add-day style="margin-top:16px">Add a spend on this day</button>
+      <button class="btn ghost" value="cancel" formnovalidate>Close</button>
+    </form>`;
+  showSheet();
+}
+
+sheet.addEventListener('click', (e) => {
+  const day = sheet.querySelector('#day-form')?.dataset.day;
+  if (!day) return;
+  const del = e.target.closest('[data-del]');
+  if (del) {
+    deleteTxn(del.dataset.del);
+    render();
+    return openDaySheet(day);
+  }
+  const row = e.target.closest('[data-edit]');
+  if (row) return openAddSheet(state.txns.find((t) => t.id === row.dataset.edit), { day });
+  if (e.target.closest('[data-add-day]')) openAddSheet({ date: day }, { day });
+});
 
 function openSmsSheet() {
   sheet.innerHTML = `
@@ -765,15 +832,27 @@ function openSmsSheet() {
       <button class="btn" value="parse">Add spends</button>
       <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
     </form>`;
-  sheet.showModal();
+  showSheet();
 }
 
 sheet.addEventListener('close', () => {
   const form = sheet.querySelector('form');
-  if (!form || sheet.returnValue === 'cancel' || !sheet.returnValue) return;
+  // An add/edit opened from a day's list goes back to that list when done.
+  const backToDay = form && form.id !== 'day-form' && form.dataset.day;
+  const value = sheet.returnValue;
+  sheet.returnValue = '';
+  if (form && value && value !== 'cancel') handleSheet(form, value);
+  if (backToDay) openDaySheet(backToDay);
+});
+
+function handleSheet(form, value) {
   const data = Object.fromEntries(new FormData(form));
   if (form.id === 'add-form') {
     if (addTxn(data)) { toast(`−${inr(data.amount)} · ${data.name}`); render(); }
+  } else if (form.id === 'edit-form') {
+    if (value === 'delete') { deleteTxn(form.dataset.id); toast('Spend deleted'); }
+    else if (updateTxn(form.dataset.id, data)) toast('Saved');
+    render();
   } else if (form.id === 'sms-form') {
     const results = splitMessages(data.sms).map(importMessage);
     const added = results.filter((r) => r && !r.dup);
@@ -786,8 +865,7 @@ sheet.addEventListener('close', () => {
     toast(parts.join(' · '), dups.length || !added.length ? 6000 : undefined);
     render();
   }
-  sheet.returnValue = '';
-});
+}
 
 /* ================= Notifications ================= */
 
@@ -915,6 +993,10 @@ $('#fab').addEventListener('click', () => openAddSheet());
 
 view.addEventListener('click', async (e) => {
   const t = e.target.closest('button');
+  const row = e.target.closest('[data-edit]');
+  if (row && !t) return openAddSheet(state.txns.find((x) => x.id === row.dataset.edit));
+  const cell = e.target.closest('[data-day]');
+  if (cell) return openDaySheet(cell.dataset.day);
   if (!t) return;
   if (t.dataset.quick) {
     const q = QUICK_ADD[t.dataset.quick];
