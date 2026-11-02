@@ -196,6 +196,12 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .sub-row:last-child { border-bottom: 0; }
 .sub-row .r { color: var(--red); font-weight: 700; }
 
+/* ---- iPhone guide ---- */
+.guide ol { margin: 4px 0 12px; padding-left: 20px; font-size: 14px; line-height: 1.55; }
+.guide li { margin-bottom: 6px; }
+.guide code { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; font-size: 13px; color: var(--green); }
+.guide input { min-width: 0; font-size: 13px; }
+
 /* ---- Forms ---- */
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
 .field input, .field select, .field textarea {

@@ -39,10 +39,24 @@ offline mode and notifications from the installed app — needs `http://localhos
 
 Settings → **Load demo data** fills ~40 days of sample spends so you can see the month and insights views.
 
+## iPhone: auto-add from SMS & email (no bank connection)
+
+iOS doesn't let any app read your messages, but a **Shortcuts automation** can pass each bank alert to the app:
+
+1. Shortcuts → Automation → **+** → **Message** → *Message Contains* `debited` → **Run Immediately**.
+2. Actions: **URL Encode** (Shortcut Input → Content) → **Open URLs** `https://<where-the-app-is-hosted>/#sms=<URL Encoded Text>`.
+3. Repeat with the **Email** trigger (subject contains `debited` or sender is your bank) using the email Body.
+
+The text travels in the URL fragment (`#…`), which browsers never send to the server. It's parsed on the phone.
+Balances ("Avl Bal Rs …") are ignored, credits are skipped, and the same message is never counted twice.
+The same steps are in the app under Settings, with a copy button for the link.
+
+The app must be reachable from the phone (static hosting such as GitHub Pages, or this PC's IP on the same Wi-Fi).
+Use it in Safari rather than "Add to Home Screen", because iOS gives home-screen apps separate storage and shortcuts open Safari.
+
 ## Limits
 
-- Web apps can't read your SMS inbox, so "automatic" tracking is paste-to-add. A native Android app
-  (SMS permission) or an Account Aggregator integration would be needed for fully hands-free tracking.
+- On Android or desktop there's no automation hook, so it's paste-to-add there ("Paste SMS").
 - The nightly notification fires while the app/tab is open (or when you next open it after the set time).
   Guaranteed delivery with the app closed would need a push server.
 

@@ -14,6 +14,7 @@ const DEFAULT_STATE = {
   },
   txns: [],                  // { id, date: 'YYYY-MM-DD', time, name, category, method, amount }
   lastSummary: null,         // date key of the last night-summary sent
+  seenSms: [],               // fingerprints of auto-imported messages, so a re-opened link isn't counted twice
 };
 
 function load() {
@@ -140,15 +141,21 @@ const QUICK_ADD = [
  *  "INR 1,250.00 spent on your Card XX12 at ZEPTO on 2026-11-02"
  */
 function parseSms(text) {
+  text = String(text).replace(/\s+/g, ' ').trim(); // emails arrive with line breaks
   if (!/debited|paid|spent|sent|withdrawn|purchase|txn|payment of/i.test(text)) return null;
   if (/credited to your|received from|refund/i.test(text) && !/debited/i.test(text)) return null;
-  const amt = text.match(/(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)/i);
-  if (!amt) return null;
-  const amount = parseFloat(amt[1].replace(/,/g, ''));
+  // Skip "Avl Bal Rs 12,000" / "credit limit INR 50,000" — take the first amount that isn't a balance.
+  const amounts = [...text.matchAll(/(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)/gi)]
+    .filter((m) => !/(bal(ance)?|limit|avl\.?|available)\s*(is|:)?\s*$/i.test(text.slice(Math.max(0, m.index - 20), m.index)));
+  if (!amounts.length) return null;
+  const amount = parseFloat(amounts[0][1].replace(/,/g, ''));
+  if (!(amount > 0)) return null;
   let name = '';
   const vpa = text.match(/(?:vpa|upi id)\s*:?\s*([\w.\-]+)@[\w.]+/i);
   const to = text.match(/\b(?:to|at|towards)\s+(?:vpa\s+)?([A-Za-z][\w&' .\-]{1,40}?)(?=\s+(?:on|via|ref|upi|using|from|for|avl|a\/c|\.|$)|[.,(]|@)/i);
+  const info = text.match(/\binfo:?\s*(?:upi|pos|imps|neft|ach|ecom)?[-\/ ]*([A-Za-z][\w&' .]{1,30}?)(?=[.,]|\s+avl|\s+on\b|$)/i);
   if (to) name = to[1];
+  else if (info) name = info[1];
   else if (vpa) name = vpa[1];
   name = name.replace(/[._\-]+/g, ' ').replace(/\s+/g, ' ').trim() || 'UPI payment';
   name = name.length > 22 ? name.slice(0, 22) : name;
@@ -446,6 +453,27 @@ function renderSettings() {
       </form>
     </section>
 
+    <div class="label section-title">iPhone: auto-add from SMS &amp; email</div>
+    <section class="card guide">
+      <p class="sub" style="margin-top:0">No bank login needed. An iPhone Shortcuts automation passes each “debited” alert to this app, which reads the amount on your phone. The message text is never sent to a server.</p>
+      <div class="field">
+        <label class="label" for="sms-link">Link to use in the shortcut</label>
+        <div class="row" style="gap:8px">
+          <input id="sms-link" readonly value="${esc(location.origin + location.pathname)}#sms=" />
+          <button class="btn ghost" style="flex:none;width:auto;padding:0 16px" data-action="copy-link">Copy</button>
+        </div>
+      </div>
+      <ol>
+        <li>Open <b>Shortcuts</b> → <b>Automation</b> → <b>+</b> → <b>Message</b>.</li>
+        <li><b>Message Contains</b>: <code>debited</code> → choose <b>Run Immediately</b> → Next → <b>New Blank Automation</b>.</li>
+        <li>Add <b>URL Encode</b>, input = <b>Shortcut Input</b> (tap it and pick the message <b>Content</b>).</li>
+        <li>Add <b>Open URLs</b> with the link above, then insert the <b>URL Encoded Text</b> variable right after <code>#sms=</code>.</li>
+        <li>For bank emails do the same with the <b>Email</b> trigger (Subject contains <code>debited</code>, or Sender is your bank's alert address), picking the email's <b>Body</b>.</li>
+      </ol>
+      <p class="sub">Open this app in <b>Safari</b> (bookmark it) rather than “Add to Home Screen”. iOS keeps home-screen apps' data separate, and shortcuts always open Safari. Each message is counted once, even if the link opens twice.</p>
+      <button class="btn ghost" data-action="test-import">Try it with a sample message</button>
+    </section>
+
     <div class="label section-title">Data</div>
     <section class="card">
       <button class="btn ghost" data-action="test-notify">Send me tonight's summary now</button>
@@ -580,6 +608,40 @@ function checkNightly() {
 }
 setInterval(checkNightly, 30_000);
 
+/* ================= Auto-import (iPhone Shortcuts) ================= */
+
+/**
+ * An iOS Shortcuts automation ("When I get a message/email containing 'debited'")
+ * opens  <app>/#sms=<url-encoded text>.  The text lives in the URL fragment, which
+ * browsers never send to the server — it is parsed here, on the phone.
+ */
+function fingerprint(s) {
+  let h = 5381;
+  for (const c of s.replace(/\s+/g, ' ').trim()) h = ((h << 5) + h + c.charCodeAt(0)) | 0;
+  return String(h >>> 0);
+}
+
+function importFromHash() {
+  const m = location.hash.match(/^#sms=([\s\S]*)$/);
+  if (!m) return;
+  history.replaceState(null, '', location.pathname + location.search);
+  let text;
+  try { text = decodeURIComponent(m[1].replace(/\+/g, ' ')); } catch { text = m[1]; }
+  if (!state.settings.income) return toast('Set your monthly income first, then the message will be counted next time.');
+  const fp = fingerprint(text);
+  if (state.seenSms.includes(fp)) return toast('Already added that one');
+  const p = parseSms(text);
+  if (!p) return toast("No debit found in that message — nothing added");
+  addTxn(p);
+  state.seenSms = [...state.seenSms, fp].slice(-300);
+  save();
+  tab = 'today';
+  render();
+  toast(`Auto-added −${inr(p.amount)} · ${p.name}`);
+}
+
+window.addEventListener('hashchange', importFromHash);
+
 /* ================= Misc ================= */
 
 let toastTimer;
@@ -659,6 +721,13 @@ view.addEventListener('click', async (e) => {
     render();
   } else if (t.dataset.action === 'sms') openSmsSheet();
   else if (t.dataset.action === 'export') exportCsv();
+  else if (t.dataset.action === 'copy-link') {
+    const v = $('#sms-link').value;
+    try { await navigator.clipboard.writeText(v); toast('Link copied'); } catch { $('#sms-link').select(); }
+  } else if (t.dataset.action === 'test-import') {
+    const sample = `Rs.250.00 debited from A/c XX1234 on ${todayKey()} to VPA starbucks@hdfcbank. UPI Ref ${Date.now() % 1e9}. Avl Bal Rs.42,310.00`;
+    location.hash = 'sms=' + encodeURIComponent(sample);
+  }
   else if (t.dataset.action === 'demo') {
     if (!state.txns.length || confirm('Replace your transactions with ~40 days of demo data?')) { loadDemo(); toast('Demo data loaded'); tab = 'today'; render(); }
   } else if (t.dataset.action === 'reset') {
@@ -703,4 +772,5 @@ document.addEventListener('visibilitychange', () => {
 });
 
 render();
+importFromHash();
 checkNightly();
