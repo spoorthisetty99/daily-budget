@@ -47,6 +47,14 @@ try { outbox = JSON.parse(localStorage.getItem(OUTBOX_KEY)) || []; } catch { /* 
 const saveOutbox = () => localStorage.setItem(OUTBOX_KEY, JSON.stringify(outbox));
 const shareable = (s) => ({ settings: s.settings, txns: s.txns, seenSms: s.seenSms });
 
+// The app key (BUDGET_KEY on the server) guards your data once the app is on the internet.
+const APPKEY_KEY = 'daily-budget-key';
+let appKey = '';
+try { appKey = localStorage.getItem(APPKEY_KEY) || ''; } catch { /* private mode */ }
+let needKey = false;
+const api = (path, opts = {}) =>
+  fetch(path, { ...opts, headers: { ...(opts.headers || {}), ...(appKey ? { 'X-Budget-Key': appKey } : {}) } });
+
 function queueOps(ops) {
   outbox.push(...ops);
   saveOutbox();
@@ -73,16 +81,17 @@ async function flush() {
   flushing = true;
   const ops = outbox.splice(0);
   try {
-    const res = await fetch('api/ops', {
+    const res = await api('api/ops', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ops }),
     });
+    if (res.status === 401) { needKey = true; render(); }
     if (!res.ok) throw new Error(res.status);
     if (adopt(await res.json()) && !isEditing()) render();
   } catch {
     outbox.unshift(...ops);
-    toast('Saved on this phone. It will sync when your PC is reachable.');
+    if (!needKey) toast('Saved on this phone. It will sync when the server is reachable.');
   } finally {
     saveOutbox();
     flushing = false;
@@ -94,16 +103,21 @@ const isEditing = () =>
   sheet.open ||
   (view.contains(document.activeElement) &&
     /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) &&
-    !document.activeElement.closest('#onboard-form'));
+    !document.activeElement.closest('#onboard-form, #key-form'));
 
 /** Finds the server; on first contact moves this device's data up if the server has none. */
 async function connect() {
   let res;
   try {
-    res = await fetch('api/state', { cache: 'no-store' });
+    res = await api('api/state', { cache: 'no-store' });
   } catch {
-    return; // PC unreachable right now: keep working locally, outbox waits
+    return; // server unreachable right now: keep working locally, outbox waits
   }
+  if (res.status === 401) {
+    needKey = true; // the server has a key and we don't have the right one
+    return render();
+  }
+  needKey = false;
   if (!res.ok || !(res.headers.get('content-type') || '').includes('json')) {
     outbox = []; // plain static hosting: nothing to sync with
     saveOutbox();
@@ -126,7 +140,8 @@ async function refresh() {
   await flush();
   if (outbox.length) return;
   try {
-    const res = await fetch('api/state', { cache: 'no-store' });
+    const res = await api('api/state', { cache: 'no-store' });
+    if (res.status === 401) { needKey = true; serverMode = false; return render(); }
     if (res.ok && adopt(await res.json()) && !isEditing()) render();
   } catch { /* offline */ }
 }
@@ -403,6 +418,7 @@ let tab = 'today';
 function render() {
   document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   $('#fab').style.display = tab === 'settings' ? 'none' : '';
+  if (needKey) return renderKeyPrompt();
   if (!state.settings.income) return renderOnboarding();
   ({ today: renderToday, month: renderMonth, insights: renderInsights, settings: renderSettings })[tab]();
 }
@@ -549,6 +565,214 @@ function renderMonth() {
 }
 
 let insightRange = 'month';
+let trendMode = 'day';
+
+/* ---------- Spending trend chart (daily spends only; Fixed costs excluded) ---------- */
+
+const TREND = {
+  day:   { count: 30, compare: 7, unit: 'day' },
+  week:  { count: 12, compare: 4, unit: 'week' },
+  month: { count: 6,  compare: 3, unit: 'month' },
+};
+
+const weekStart = (k) => addDays(k, -((parseKey(k).getDay() + 6) % 7)); // Monday
+
+/** Periods oldest → newest: { from, to, label, tip, value, budget, partial }. */
+function trendSeries(mode) {
+  const k = todayKey();
+  const out = [];
+  const perDay = baseDaily(k);
+  for (let i = TREND[mode].count - 1; i >= 0; i--) {
+    let from, to, label, tip, budget;
+    if (mode === 'day') {
+      from = to = addDays(k, -i);
+      const d = parseKey(from);
+      label = String(d.getDate());
+      tip = d.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+      budget = perDay;
+    } else if (mode === 'week') {
+      from = addDays(weekStart(k), -7 * i);
+      to = addDays(from, 6);
+      label = shortDate(from);
+      tip = `${shortDate(from)} – ${shortDate(to)}`;
+      budget = perDay * 7;
+    } else {
+      const d = parseKey(monthStart(k));
+      d.setMonth(d.getMonth() - i);
+      from = keyOf(d);
+      to = monthEnd(from);
+      label = d.toLocaleDateString('en-IN', { month: 'short' });
+      tip = d.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+      budget = spendable();
+    }
+    out.push({ from, to, label, tip, budget, value: spentBetween(from, addDays(to, 1)), partial: to >= k });
+  }
+  // Drop periods from before tracking started, and treat the one tracking started in as
+  // incomplete (like the current one), so missing history doesn't fake a trend.
+  const first = [state.settings.startDate, ...state.txns.map((t) => t.date)].filter(Boolean).sort()[0];
+  if (!first) return out.slice(-1);
+  return out.filter((p) => p.to >= first).map((p) => (p.from < first ? { ...p, partial: true } : p));
+}
+
+/** Least-squares line through the complete periods: value ≈ a + b·index. */
+function fitLine(points) {
+  const n = points.length;
+  const mx = points.reduce((s, p) => s + p.x, 0) / n;
+  const my = points.reduce((s, p) => s + p.y, 0) / n;
+  const sxx = points.reduce((s, p) => s + (p.x - mx) ** 2, 0);
+  const b = sxx ? points.reduce((s, p) => s + (p.x - mx) * (p.y - my), 0) / sxx : 0;
+  return { a: my - b * mx, b };
+}
+
+/** Recent average vs the one before it ("last 7 days vs the 7 before"). */
+function trendChange(series, mode) {
+  const done = series.filter((p) => !p.partial).map((p) => p.value);
+  let n = TREND[mode].compare;
+  if (done.length < 2 * n) n = Math.floor(done.length / 2);
+  if (n < 1) return null;
+  const avg = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+  const recent = avg(done.slice(-n));
+  const before = avg(done.slice(-2 * n, -n));
+  if (!before) return null;
+  return { n, recent, before, pct: (recent - before) / before };
+}
+
+function trendCard() {
+  const mode = trendMode;
+  const series = trendSeries(mode);
+  const unit = TREND[mode].unit;
+  const change = trendChange(series, mode);
+
+  let headline;
+  if (!change) {
+    headline = `<p class="sub" style="margin:4px 0 0">Keep logging for a few more ${unit}s and the trend shows up here.</p>`;
+  } else {
+    const down = change.pct <= 0;
+    const span = `${change.n} ${unit}${change.n > 1 ? 's' : ''}`;
+    headline = `
+      <div class="trend-head">
+        <span class="trend-pill ${down ? 'good' : 'bad'}">${down ? '↓' : '↑'} ${Math.abs(Math.round(change.pct * 100))}% ${down ? 'spending down' : 'spending up'}</span>
+      </div>
+      <p class="sub" style="margin:6px 0 0">Last ${span}: <b style="color:var(--text)">${inr(change.recent)}</b> a ${unit} on average, vs ${inr(change.before)} the ${span} before.</p>`;
+  }
+
+  return `
+    <section class="card trend-card">
+      <div class="trend-top">
+        <div class="label">Spending trend</div>
+        <div class="segmented mini">
+          ${[['day', 'Daily'], ['week', 'Weekly'], ['month', 'Monthly']].map(([v, l]) =>
+            `<button data-trend="${v}" class="${mode === v ? 'on' : ''}">${l}</button>`).join('')}
+        </div>
+      </div>
+      ${headline}
+      <div class="chart-wrap">${trendSvg(series)}<div class="chart-tip" role="status"></div></div>
+      <div class="legend">
+        <span><i class="sw" style="background:#7b5cff"></i>Within budget</span>
+        <span><i class="sw" style="background:#ff3d6e"></i>Over budget</span>
+        <span><i class="ln dashed"></i>Trend</span>
+        <span><i class="ln dotted"></i>${unit === 'day' ? 'Daily' : unit === 'week' ? 'Weekly' : 'Monthly'} budget</span>
+      </div>
+      <p class="sub" style="margin-top:8px">Rent, SIP and other fixed costs aren't included. Faded bars are incomplete (the current ${unit}, or the one you started tracking in) and are left out of the trend.</p>
+      <details class="table-view">
+        <summary>Show as table</summary>
+        <table>
+          <thead><tr><th>${unit[0].toUpperCase() + unit.slice(1)}</th><th>Spent</th><th>Budget</th></tr></thead>
+          <tbody>${series.slice().reverse().map((p) => `
+            <tr><td>${esc(p.tip)}${p.partial ? ' (so far)' : ''}</td><td>${inr(p.value)}</td><td>${inr(p.budget)}</td></tr>`).join('')}
+          </tbody>
+        </table>
+      </details>
+    </section>`;
+}
+
+function trendSvg(series) {
+  const W = 340, H = 190, L = 44, R = 8, T = 12, B = 24;
+  const pw = W - L - R, ph = H - T - B;
+  const n = series.length;
+  const max = Math.max(1, ...series.map((p) => Math.max(p.value, p.budget)));
+  // Round the axis top to a friendly number.
+  const step = 10 ** Math.floor(Math.log10(max));
+  const top = Math.ceil(max / (step / 2)) * (step / 2);
+  const y = (v) => T + ph - (v / top) * ph;
+  const band = pw / n;
+  const bw = Math.max(2, Math.min(28, band - 2)); // 2px gap between bars
+  const x = (i) => L + band * i + (band - bw) / 2;
+  const short = (v) => (v >= 100000 ? `₹${(v / 100000).toFixed(1)}L` : v >= 1000 ? `₹${(v / 1000).toFixed(v >= 10000 ? 0 : 1)}k` : `₹${Math.round(v)}`);
+
+  const grid = [0, 0.5, 1].map((f) => {
+    const v = top * f, yy = y(v);
+    return `<line x1="${L}" x2="${W - R}" y1="${yy}" y2="${yy}" class="grid"/>
+            <text x="${L - 6}" y="${yy + 3}" class="axis" text-anchor="end">${short(v)}</text>`;
+  }).join('');
+
+  const every = n > 14 ? Math.ceil(n / 6) : n > 8 ? 2 : 1;
+  const bars = series.map((p, i) => {
+    const h = Math.max(0, y(0) - y(p.value));
+    const r = Math.min(4, h, bw / 2);
+    const x0 = x(i), y0 = y(0);
+    // Rounded data end, square at the baseline.
+    const path = h > 0
+      ? `M${x0},${y0} V${y0 - h + r} Q${x0},${y0 - h} ${x0 + r},${y0 - h} H${x0 + bw - r} Q${x0 + bw},${y0 - h} ${x0 + bw},${y0 - h + r} V${y0} Z`
+      : '';
+    const over = p.value > p.budget;
+    const lbl = (n - 1 - i) % every === 0
+      ? `<text x="${x0 + bw / 2}" y="${H - 8}" class="axis" text-anchor="middle">${esc(p.label)}</text>` : '';
+    return `
+      <path d="${path}" class="bar ${over ? 'over' : ''} ${p.partial ? 'partial' : ''}"/>
+      ${lbl}
+      <rect class="hit" x="${L + band * i}" y="${T}" width="${band}" height="${ph}" tabindex="0"
+        data-i="${i}" aria-label="${esc(p.tip)}: ${inr(p.value)} of ${inr(p.budget)} budget"/>`;
+  }).join('');
+
+  // Budget reference + trend line through complete periods.
+  const budgetY = y(series[series.length - 1]?.budget || 0);
+  const pts = series.map((p, i) => ({ x: i, y: p.value, partial: p.partial })).filter((p) => !p.partial);
+  let trend = '';
+  if (pts.length >= 3) {
+    const { a, b } = fitLine(pts);
+    const x1 = pts[0].x, x2 = pts[pts.length - 1].x;
+    const cx = (i) => x(i) + bw / 2;
+    trend = `<line x1="${cx(x1)}" y1="${y(Math.max(0, a + b * x1))}" x2="${cx(x2)}" y2="${y(Math.max(0, a + b * x2))}" class="trend"/>`;
+  }
+
+  return `
+    <svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="Spending per period with trend line">
+      ${grid}
+      ${bars}
+      <line x1="${L}" x2="${W - R}" y1="${budgetY}" y2="${budgetY}" class="budget"/>
+      ${trend}
+    </svg>`;
+}
+
+/** Tooltip for the trend bars (hover, tap or keyboard focus). */
+function showTrendTip(hit) {
+  const wrap = hit.closest('.chart-wrap');
+  const tip = wrap.querySelector('.chart-tip');
+  const p = trendSeries(trendMode)[Number(hit.dataset.i)];
+  if (!p) return;
+  tip.replaceChildren();
+  const v = document.createElement('strong');
+  v.textContent = inr(p.value);
+  const l = document.createElement('span');
+  l.textContent = `${p.tip}${p.partial ? ' (so far)' : ''} · budget ${inr(p.budget)}`;
+  tip.append(v, l);
+  const svg = wrap.querySelector('svg').getBoundingClientRect();
+  const r = hit.getBoundingClientRect();
+  const left = Math.min(Math.max(r.left - svg.left + r.width / 2, 70), svg.width - 70);
+  tip.style.left = `${left}px`;
+  tip.classList.add('show');
+  wrap.querySelectorAll('.bar').forEach((b, i) => b.classList.toggle('hover', i === Number(hit.dataset.i)));
+}
+
+function hideTrendTip(wrap) {
+  wrap.querySelector('.chart-tip')?.classList.remove('show');
+  wrap.querySelectorAll('.bar.hover').forEach((b) => b.classList.remove('hover'));
+}
+
+view.addEventListener('pointerover', (e) => { const h = e.target.closest?.('.hit'); if (h) showTrendTip(h); });
+view.addEventListener('focusin', (e) => { const h = e.target.closest?.('.hit'); if (h) showTrendTip(h); });
+view.addEventListener('pointerout', (e) => { const w = e.target.closest?.('.chart-wrap'); if (w && !w.contains(e.relatedTarget)) hideTrendTip(w); });
 
 function renderInsights() {
   const k = todayKey();
@@ -571,7 +795,9 @@ function renderInsights() {
   const subsTotal = subs.reduce((s, x) => s + x.amount, 0);
 
   view.innerHTML = `
-    <div class="segmented">
+    ${trendCard()}
+
+    <div class="segmented" style="margin-top:22px">
       ${[['week', '7 days'], ['month', 'This month'], ['all', 'All time']].map(([v, l]) =>
         `<button data-range="${v}" class="${insightRange === v ? 'on' : ''}">${l}</button>`).join('')}
     </div>
@@ -766,33 +992,63 @@ function serverGuide() {
       <input id="${id}" readonly value="${esc(value)}" />
       <button class="btn ghost" style="flex:none;width:auto;padding:0 16px" data-action="copy" data-copy="${id}">Copy</button>
     </div>`;
+  const hosted = location.protocol === 'https:';
+  const where = hosted ? 'the server' : 'your PC';
+  const keyRows = appKey ? `
+      <label class="label">App key (send it as a header)</label>
+      ${copy('key-copy', appKey)}` : '';
+  const keyStep = appKey
+    ? ` Under <b>Headers</b>, add <code>X-Budget-Key</code> with the app key above.` : '';
   return `
     <div class="label section-title">Install as an app</div>
     <section class="card guide">
-      <ol>
-        <li>Open <b>${esc(base)}</b> in <b>Safari</b> on your iPhone.</li>
-        <li>Tap <b>Share</b> → <b>Add to Home Screen</b> → <b>Add</b>.</li>
-      </ol>
-      <p class="sub">It opens full-screen from its own icon. Your data lives on your PC, so the app, Safari and your PC all show the same spends.</p>
+      <p class="sub" style="margin-top:0"><b>iPhone:</b> open <b>${esc(base)}</b> in <b>Safari</b> → <b>Share</b> → <b>Add to Home Screen</b>.</p>
+      <p class="sub"><b>Android:</b> open it in <b>Chrome</b> → <b>⋮</b> → <b>Install app</b> (or <b>Add to Home screen</b>)${hosted ? '' : '. Android only offers a real install over https, so host the app first (README)'}.</p>
+      <p class="sub">Your data lives on ${where}, so every device that opens the app shows the same spends.</p>
     </section>
 
-    <div class="label section-title">iPhone: auto-add in the background</div>
+    <div class="label section-title">Auto-add bank alerts in the background</div>
     <section class="card guide">
-      <p class="sub" style="margin-top:0">Each bank alert is sent to your PC, which reads it and saves the spend. You get a notification and nothing opens.</p>
+      <p class="sub" style="margin-top:0">Each bank alert is sent to ${where}, which reads it and saves the spend. You get a notification and nothing opens.</p>
       <label class="label">Alert URL</label>
       ${copy('sms-api', base + '/api/sms')}
+      ${keyRows}
+      <p class="sub"><b>iPhone (Shortcuts)</b></p>
       <ol>
-        <li><b>Shortcuts</b> → <b>Automation</b> → <b>+</b> → <b>Message</b> → Message Contains <code>Sent Rs</code> → <b>Run Immediately</b> → Next → <b>New Blank Automation</b>.</li>
-        <li>Add <b>Get Contents of URL</b>. Set the URL to the alert URL above. Tap <b>›</b> to show more: Method <b>POST</b>, Request Body <b>JSON</b>, add a <b>Text</b> field with key <code>text</code> and value <b>Shortcut Input › Content</b>.</li>
-        <li>Add <b>Show Notification</b> and set its text to <b>Contents of URL</b>.</li>
-        <li>Make the same automation for <code>debited</code> and <code>spent</code>. For bank emails, use the <b>Email</b> trigger and pick the email's <b>Body</b>.</li>
+        <li><b>Automation</b> → <b>+</b> → <b>Message</b> → Message Contains <code>Sent Rs</code> → <b>Run Immediately</b> → <b>New Blank Automation</b>.</li>
+        <li><b>Get Contents of URL</b> with the alert URL. Tap <b>›</b>: Method <b>POST</b>, Request Body <b>JSON</b>, a <b>Text</b> field with key <code>text</code> = <b>Shortcut Input › Content</b>.${keyStep}</li>
+        <li><b>Show Notification</b> with <b>Contents of URL</b>.</li>
+        <li>Repeat for <code>debited</code> and <code>spent</code>. For bank emails, use the <b>Email</b> trigger and the email's <b>Body</b>.</li>
+      </ol>
+      <p class="sub"><b>Android (MacroDroid, free)</b></p>
+      <ol>
+        <li>Trigger: <b>SMS Received</b> → Any number → Message <b>contains</b> <code>Sent Rs</code>.</li>
+        <li>Action: <b>HTTP Request</b> → POST to the alert URL, body type <code>text/plain</code>, body <code>[sms_message]</code>.${appKey ? ' Add header <code>X-Budget-Key</code> with the app key.' : ''} Save the response to a text variable.</li>
+        <li>Action: <b>Display Notification</b> with that variable as the text.</li>
+        <li>Repeat for <code>debited</code> and <code>spent</code>.</li>
       </ol>
       <label class="label">Nightly summary URL</label>
       ${copy('summary-api', base + '/api/summary')}
-      <ol start="5">
-        <li><b>Time of Day</b> automation (e.g. 9 PM, Run Immediately): <b>Get Contents of URL</b> with the summary URL, then <b>Show Notification</b> with <b>Contents of URL</b>.</li>
-      </ol>
-      <p class="sub">Your PC must be on with <code>start-server.cmd</code> running, and the phone on the same Wi-Fi. Alerts that arrive while you're away fail; paste those in later with <b>Paste SMS</b>.</p>
+      <p class="sub">At 9 PM (Shortcuts: <b>Time of Day</b>; MacroDroid: <b>Day/Time</b> trigger), fetch this URL with a GET${appKey ? ' and the same header' : ''}, then show the response as a notification.</p>
+      <p class="sub">${hosted
+        ? "The server is always on, so this works anywhere you have mobile data or Wi-Fi."
+        : "Your PC must be on with <code>start-server.cmd</code> running, and the phone on the same Wi-Fi. Alerts that arrive while you're away fail; paste those in later with <b>Paste SMS</b>."}</p>
+    </section>`;
+}
+
+function renderKeyPrompt() {
+  $('#fab').style.display = 'none';
+  view.innerHTML = `
+    <section class="card">
+      <div class="label">Locked</div>
+      <h2 style="font-size:24px;font-weight:900;margin:8px 0 6px">Enter your app key</h2>
+      <p class="sub" style="margin-top:0">This app is protected so only you can see your spends. The key is the <code>BUDGET_KEY</code> you set when hosting it. You only need to enter it once on each device.</p>
+      <form id="key-form" style="margin-top:16px">
+        <div class="field">
+          <input name="key" type="password" autocomplete="current-password" placeholder="App key" required autofocus />
+        </div>
+        <button class="btn" type="submit">Unlock</button>
+      </form>
     </section>`;
 }
 
@@ -1096,6 +1352,9 @@ view.addEventListener('click', async (e) => {
   } else if (t.dataset.range) {
     insightRange = t.dataset.range;
     render();
+  } else if (t.dataset.trend) {
+    trendMode = t.dataset.trend;
+    render();
   } else if (t.dataset.action === 'sms') openSmsSheet();
   else if (t.dataset.action === 'export') exportCsv();
   else if (t.dataset.action === 'add-fixed') openFixedSheet();
@@ -1131,6 +1390,13 @@ view.addEventListener('click', async (e) => {
 view.addEventListener('submit', async (e) => {
   e.preventDefault();
   const data = Object.fromEntries(new FormData(e.target));
+  if (e.target.id === 'key-form') {
+    appKey = String(data.key || '').trim();
+    try { localStorage.setItem(APPKEY_KEY, appKey); } catch { /* private mode */ }
+    await connect();
+    if (needKey) toast("That key didn't work");
+    return;
+  }
   if (e.target.id === 'onboard-form') {
     state.settings.income = Number(data.income);
     state.settings.startDate = todayKey();

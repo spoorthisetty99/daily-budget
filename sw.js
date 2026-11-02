@@ -1,6 +1,6 @@
 // Offline cache + notification click handling.
-const CACHE = 'daily-budget-v1';
-const ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'icon.svg', 'apple-touch-icon.png', 'manifest.webmanifest'];
+const CACHE = 'daily-budget-v2';
+const ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'icon.svg', 'apple-touch-icon.png', 'icon-192.png', 'icon-512.png', 'manifest.webmanifest'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)));

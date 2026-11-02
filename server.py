@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Daily Budget server: serves the app and keeps your data on this PC (data.json).
+"""Daily Budget server: serves the app and keeps your data in data.json.
 
-Run:  python server.py      then open  http://<this PC's Wi-Fi IP>:5173  on your phone.
+On your PC:        python server.py   then open  http://<this PC's Wi-Fi IP>:5173
+On a host (WSGI):  point the host's WSGI config at `application` in this file
+                   (see README: PythonAnywhere) and set BUDGET_KEY.
 
-API (used by the app and the iPhone Shortcuts automations):
+API (used by the app and the phone automations):
   GET  /api/state     the whole state (settings, transactions)
   POST /api/ops       apply the app's changes; returns the new state
   POST /api/sms       a bank alert (raw text, JSON {"text": ...} or form text=...);
                       saves the spend and answers with a one-line notification text
   GET  /api/summary   tonight's good/bad-day summary as plain text
 
+When BUDGET_KEY is set, every /api/ call needs it, in an X-Budget-Key header (or ?key=).
+
 The SMS parser and budget maths mirror app.js; keep the two in sync.
 """
 import calendar
+import hmac
 import json
 import os
 import re
@@ -20,17 +25,30 @@ import socket
 import threading
 import uuid
 from datetime import date, datetime, timedelta
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get('BUDGET_DATA') or os.path.join(ROOT, 'data.json')
 PORT = int(os.environ.get('PORT', 5173))
+KEY = os.environ.get('BUDGET_KEY', '')  # required once the app is on the internet
 LOCK = threading.Lock()
+
+# Hosts usually run on UTC; spends must land on the right Indian day.
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo(os.environ.get('BUDGET_TZ', 'Asia/Kolkata'))
+except Exception:  # no tz database (e.g. Windows without tzdata): the PC's own clock is fine
+    TZ = None
+
+
+def now():
+    return datetime.now(TZ) if TZ else datetime.now()
+
 
 # Only the app's own files are served, never data.json or .git.
 STATIC = {'/', '/index.html', '/styles.css', '/app.js', '/sw.js', '/manifest.webmanifest',
-          '/icon.svg', '/apple-touch-icon.png'}
+          '/icon.svg', '/apple-touch-icon.png', '/icon-192.png', '/icon-512.png'}
 
 DEFAULT_SETTINGS = {'income': 0, 'rollover': True, 'reminderTime': '21:00', 'notify': False, 'startDate': None,
                     'fixed': []}
@@ -61,7 +79,7 @@ def store(s):
 # ================= Dates & money =================
 
 def today():
-    return date.today().isoformat()
+    return now().date().isoformat()
 
 
 def pkey(k):
@@ -280,7 +298,7 @@ def add_from_sms(text):
         s['txns'].append({
             'id': str(uuid.uuid4()),
             'date': p['date'],
-            'time': datetime.now().strftime('%H:%M'),
+            'time': now().strftime('%H:%M'),
             'name': p['name'],
             'category': p['category'],
             'method': p['method'],
@@ -348,13 +366,72 @@ def body_text(raw, ctype):
     return raw
 
 
-class Handler(SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=ROOT, **kwargs)
+TEXT = 'text/plain; charset=utf-8'
+JSON = 'application/json; charset=utf-8'
+TYPES = {  # explicit, since Windows' registry can map .js to text/plain
+    '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
+    '.js': 'text/javascript; charset=utf-8', '.webmanifest': 'application/manifest+json',
+    '.svg': 'image/svg+xml', '.png': 'image/png',
+}
 
-    def end_headers(self):
-        self.send_header('Cache-Control', 'no-cache')  # phones always get the latest app
-        super().end_headers()
+
+def key_ok(headers, query):
+    if not KEY:
+        return True
+    given = headers.get('x-budget-key') or (parse_qs(query).get('key') or [''])[0]
+    return hmac.compare_digest(given.strip().encode(), KEY.encode())
+
+
+def respond(method, target, headers, body):
+    """One request → (status, content type, body bytes). Shared by the PC server and WSGI.
+    `headers` is a dict with lower-case names."""
+    url = urlparse(target)
+    path = url.path
+    if path.startswith('/api/'):
+        if not key_ok(headers, url.query):
+            return 401, TEXT, b'Wrong or missing app key. Add the X-Budget-Key header (Settings in the app shows it).'
+        raw = body.decode('utf-8', 'replace')
+        if method == 'GET' and path == '/api/state':
+            return 200, JSON, json.dumps(load(), ensure_ascii=False).encode()
+        if method == 'GET' and path == '/api/summary':
+            return 200, TEXT, summary_text().encode()
+        if method == 'POST' and path == '/api/sms':
+            return 200, TEXT, add_from_sms(body_text(raw, headers.get('content-type', ''))).encode()
+        if method == 'POST' and path == '/api/ops':
+            try:
+                ops = json.loads(raw)['ops']
+            except (ValueError, KeyError, TypeError):
+                return 400, TEXT, b'Bad request'
+            return 200, JSON, json.dumps(apply_ops(ops), ensure_ascii=False).encode()
+        return 404, TEXT, b'Not found'
+    if method in ('GET', 'HEAD') and path in STATIC:
+        name = 'index.html' if path == '/' else path[1:]
+        with open(os.path.join(ROOT, name), 'rb') as f:
+            data = f.read()
+        return 200, TYPES[os.path.splitext(name)[1]], data
+    return 404, TEXT, b'Not found'
+
+
+def application(environ, start_response):
+    """WSGI entry point (PythonAnywhere and other hosts)."""
+    try:
+        length = int(environ.get('CONTENT_LENGTH') or 0)
+    except ValueError:
+        length = 0
+    body = environ['wsgi.input'].read(length) if length else b''
+    headers = {k[5:].replace('_', '-').lower(): v for k, v in environ.items() if k.startswith('HTTP_')}
+    headers['content-type'] = environ.get('CONTENT_TYPE', '')
+    target = environ.get('PATH_INFO', '/') + ('?' + environ['QUERY_STRING'] if environ.get('QUERY_STRING') else '')
+    status, ctype, data = respond(environ['REQUEST_METHOD'], target, headers, body)
+    start_response(f'{status} {"OK" if status == 200 else "Error"}', [
+        ('Content-Type', ctype), ('Content-Length', str(len(data))),
+        ('Cache-Control', 'no-cache'),  # phones always get the latest app
+    ])
+    return [b''] if environ['REQUEST_METHOD'] == 'HEAD' else [data]
+
+
+class Handler(BaseHTTPRequestHandler):
+    """The PC server: same responses as `application`."""
 
     def read_body(self):
         if self.headers.get('Transfer-Encoding', '').lower() == 'chunked':
@@ -366,52 +443,22 @@ class Handler(SimpleHTTPRequestHandler):
                     break
                 chunks.append(self.rfile.read(size))
                 self.rfile.readline()
-            raw = b''.join(chunks)
-        else:
-            raw = self.rfile.read(int(self.headers.get('Content-Length') or 0))
-        return raw.decode('utf-8', 'replace')
+            return b''.join(chunks)
+        return self.rfile.read(int(self.headers.get('Content-Length') or 0))
 
-    def send(self, code, body, ctype):
-        data = body.encode('utf-8')
-        self.send_response(code)
+    def handle_any(self):
+        body = self.read_body() if self.command == 'POST' else b''
+        headers = {k.lower(): v for k, v in self.headers.items()}
+        status, ctype, data = respond(self.command, self.path, headers, body)
+        self.send_response(status)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != 'HEAD':
+            self.wfile.write(data)
 
-    def send_text(self, text):
-        self.send(200, text, 'text/plain; charset=utf-8')
-
-    def send_json(self, obj):
-        self.send(200, json.dumps(obj, ensure_ascii=False), 'application/json; charset=utf-8')
-
-    def do_GET(self):
-        path = urlparse(self.path).path
-        if path == '/api/state':
-            return self.send_json(load())
-        if path == '/api/summary':
-            return self.send_text(summary_text())
-        if path in STATIC:
-            return super().do_GET()
-        self.send_error(404)
-
-    def do_HEAD(self):
-        if urlparse(self.path).path in STATIC:
-            return super().do_HEAD()
-        self.send_error(404)
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-        raw = self.read_body()
-        if path == '/api/sms':
-            return self.send_text(add_from_sms(body_text(raw, self.headers.get('Content-Type', ''))))
-        if path == '/api/ops':
-            try:
-                ops = json.loads(raw)['ops']
-            except (ValueError, KeyError, TypeError):
-                return self.send_error(400)
-            return self.send_json(apply_ops(ops))
-        self.send_error(404)
+    do_GET = do_POST = do_HEAD = handle_any
 
 
 def lan_ip():

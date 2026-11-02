@@ -27,22 +27,72 @@ which goes green → yellow → red as it drains. At night you get a
 - **Month view** — calendar of good/bad days with totals.
 - **Insights** — spend by category, top merchants, and **subscriptions** (explicit or detected as
   the same merchant charging a similar amount in two or more months) with monthly/yearly cost.
-- CSV export, demo data, installable on the iPhone home screen.
+- **Spending trend** (Insights) — daily / weekly / monthly bars against the budget, a trend line, and
+  "↓ 12% spending down: last 7 days vs the 7 before". Fixed costs and incomplete periods are left out.
+- CSV export, demo data, installable on iPhone and Android home screens.
 
 ## Run it
 
-No build step and no dependencies beyond Python 3. On the PC, double-click **`start-server.cmd`**
-(or run `python server.py`). It prints the address to open on your phone, e.g. `http://192.168.0.5:5173`.
+No build step and no dependencies beyond Python 3. `server.py` serves the app and keeps your data in
+`data.json` next to it (git-ignored), so every device that opens the app sees the same spends.
 
-`server.py` serves the app and keeps your data in `data.json` next to it (git-ignored), so the iPhone app,
-Safari and the PC all see the same spends. The first device that opens the app uploads what it already has.
-Served by any other static host instead, the app falls back to keeping data in that browser only.
+- **On your PC (home Wi-Fi only):** double-click **`start-server.cmd`** (or `python server.py`). It prints the
+  address to open on your phone, e.g. `http://192.168.0.5:5173`.
+- **Always on, from anywhere:** host it on PythonAnywhere (below).
 
 Settings → **Load demo data** fills ~40 days of sample spends so you can see the month and insights views.
 
-## Install on iPhone
+## Host it on PythonAnywhere (free, always on)
 
-Open the address in **Safari** → **Share** → **Add to Home Screen**. It gets its own icon and opens full-screen.
+Why PythonAnywhere and not Render's free plan: Render's free servers go to sleep after 15 minutes (the first bank
+alert after a quiet spell can time out) and wipe their files on every restart (your `data.json` would vanish).
+PythonAnywhere's free plan stays on, keeps files, and gives you HTTPS (needed to install on Android).
+
+1. Sign up at **pythonanywhere.com** (free "Beginner" plan). Your app will live at `https://<username>.pythonanywhere.com`.
+2. **Consoles → Bash**, then:
+   ```bash
+   git clone https://github.com/spoorthisetty99/daily-budget.git
+   python3 -c "import secrets; print(secrets.token_urlsafe(24))"
+   ```
+   The repo is private, so git asks for your GitHub username and a password: use a **personal access token**
+   (GitHub → Settings → Developer settings → Fine-grained tokens → only this repo, *Contents: Read-only*).
+   The second line prints a random **app key**. Save it in your password manager.
+3. **Files** → open `daily-budget/` → **Upload a file** → your PC's `Desktop\expense\data.json` (this moves your spends over).
+4. **Web → Add a new web app → Manual configuration →** the newest Python 3.
+5. On the Web tab, open the **WSGI configuration file** link, delete everything in it, and paste (with your
+   username and key):
+   ```python
+   import os, sys
+   os.environ['BUDGET_KEY'] = 'paste-your-app-key-here'
+   sys.path.insert(0, '/home/<username>/daily-budget')
+   from server import application
+   ```
+   Save, turn on **Force HTTPS**, and press **Reload**.
+6. Open `https://<username>.pythonanywhere.com` on your phone and enter the app key once.
+7. Point your phone automations at `https://<username>.pythonanywhere.com/api/sms` (and `/api/summary`) and add
+   the header `X-Budget-Key: <app key>`. Settings in the app shows both, with copy buttons.
+
+Updating later: in a Bash console, `cd daily-budget && git pull`, then **Reload** on the Web tab.
+Free plan housekeeping: every 3 months, press **"Run until 3 months from today"** on the Web tab.
+
+## Install on your phone
+
+- **iPhone:** open the address in **Safari** → **Share** → **Add to Home Screen**.
+- **Android:** open the address in **Chrome** → **⋮** → **Install app**. (A real install needs the HTTPS address
+  from PythonAnywhere; over the PC's Wi-Fi address Chrome only offers a home-screen shortcut.)
+
+Either way it gets its own icon and opens full-screen.
+
+## Android: auto-add bank SMS in the background
+
+Android has no Shortcuts app; the free **MacroDroid** app does the same job.
+
+1. **Add Macro → Trigger: SMS Received** → Any number → *Message content* **contains** `Sent Rs`.
+2. **Action: HTTP Request** → POST `https://<username>.pythonanywhere.com/api/sms`, body content type
+   `text/plain`, body `[sms_message]`, header `X-Budget-Key` = your app key. Save the response into a text variable.
+3. **Action: Display Notification** → text = that variable.
+4. Make the same macro for `debited` and `spent` (the free plan allows 5 macros).
+5. Nightly summary: a **Day/Time** trigger at 9 PM → HTTP Request **GET** `/api/summary` (same header) → notification.
 
 ## iPhone: auto-add from SMS & email in the background (no bank connection)
 
@@ -65,11 +115,11 @@ Older alerts (before the automation existed): copy them from Messages / Mail and
 
 ## Limits
 
-- The PC must be on with the server running, and the phone on the same Wi-Fi. Alerts that arrive while you're
-  away show "Automation failed"; paste those in later.
-- Anyone on the same Wi-Fi who knows the address can open the app and its data. Fine at home; stop the server
-  on public Wi-Fi.
-- On Android there's no automation hook, so it's paste-to-add there ("Paste SMS").
+- PC mode: the PC must be on with the server running, and the phone on the same Wi-Fi. Alerts that arrive while
+  you're away show "Automation failed"; paste those in later. Anyone on the same Wi-Fi who knows the address can
+  open the app (set `BUDGET_KEY` before starting the server to require the key there too).
+- Hosted mode: everything under `/api/` needs the app key. Keep it private; if it leaks, change it in the WSGI
+  file, Reload, and enter the new key on each device and automation.
 
 ## Files
 
@@ -78,7 +128,7 @@ Older alerts (before the automation existed): copy them from Messages / Mail and
 | `index.html` | App shell |
 | `styles.css` | Dark neon theme |
 | `app.js` | Budget engine, SMS parser, views, sync with the server |
-| `server.py` | Serves the app, stores `data.json`, `/api/sms` and `/api/summary` for Shortcuts (parser mirrors `app.js`) |
+| `server.py` | Serves the app (PC server or WSGI `application`), stores `data.json`, app-key check, `/api/sms` and `/api/summary` for phone automations (parser mirrors `app.js`) |
 | `start-server.cmd` | Double-click launcher for Windows |
 | `sw.js` | Offline cache + notification clicks |
-| `manifest.webmanifest`, `icon.svg`, `apple-touch-icon.png` | Home-screen install metadata and icons |
+| `manifest.webmanifest`, `icon.svg`, `apple-touch-icon.png`, `icon-192.png`, `icon-512.png` | Home-screen install metadata and icons (iPhone + Android) |
