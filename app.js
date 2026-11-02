@@ -143,6 +143,7 @@ const monthEnd = (k) => k.slice(0, 8) + pad(daysInMonth(k));
 const daysBetween = (a, b) => Math.round((parseKey(b) - parseKey(a)) / 86400000);
 
 const inr = (n) => '₹' + Math.round(Math.abs(n)).toLocaleString('en-IN');
+const shortDate = (k) => parseKey(k).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
 
 /* ================= Budget engine ================= */
 
@@ -304,10 +305,10 @@ function splitMessages(text) {
   return out;
 }
 
-/** Adds one alert unless it was already imported (by shortcut or paste). Returns the spend, 'dup' or null. */
+/** Adds one alert unless it was already imported (by shortcut or paste). Returns the spend, { dup: spend } or null. */
 function importMessage(text) {
   const fp = fingerprint(text);
-  if (state.seenSms.includes(fp)) return 'dup';
+  if (state.seenSms.includes(fp)) return { dup: parseSms(text) };
   const p = parseSms(text);
   if (!p) return null;
   addTxn(p);
@@ -757,7 +758,7 @@ function openSmsSheet() {
   sheet.innerHTML = `
     <form method="dialog" id="sms-form">
       <h2>Paste bank / UPI alerts</h2>
-      <p class="hint">Paste one or many SMS or emails. Leave a blank line between emails. Each spend goes on the date written in the message, and anything already added is skipped.</p>
+      <p class="hint">Reads “Sent Rs” (HDFC UPI), “debited”, “spent” and “paid” alerts. Paste one or many SMS or emails, with a blank line between emails. Each spend goes on the date written in the message, and anything already added is skipped.</p>
       <div class="field">
         <textarea name="sms" placeholder="Rs.250.00 debited from A/c XX1234 to VPA starbucks@hdfcbank on 02-11-26. UPI Ref 6312…" required></textarea>
       </div>
@@ -775,12 +776,14 @@ sheet.addEventListener('close', () => {
     if (addTxn(data)) { toast(`−${inr(data.amount)} · ${data.name}`); render(); }
   } else if (form.id === 'sms-form') {
     const results = splitMessages(data.sms).map(importMessage);
-    const added = results.filter((r) => r && r !== 'dup');
-    const dups = results.filter((r) => r === 'dup').length;
-    const msg = added.length
-      ? `Added ${added.length} spend${added.length > 1 ? 's' : ''} · ${inr(added.reduce((s, p) => s + p.amount, 0))}`
-      : "Couldn't find a new debit in that";
-    toast(dups ? `${msg} · ${dups} already added` : msg);
+    const added = results.filter((r) => r && !r.dup);
+    const dups = results.filter((r) => r?.dup).map((r) => r.dup);
+    const parts = [];
+    if (added.length) parts.push(`Added ${added.length} spend${added.length > 1 ? 's' : ''} · ${inr(added.reduce((s, p) => s + p.amount, 0))}`);
+    // Name the duplicates, so a stale clipboard (the previous message pasted again) is easy to spot.
+    if (dups.length) parts.push(`Already added: ${dups.map((p) => `${p.name} ${inr(p.amount)} (${shortDate(p.date)})`).join(', ')}`);
+    if (!parts.length) parts.push("No debit found in that. Paste the whole message, including the “Sent Rs” / “debited” line.");
+    toast(parts.join(' · '), dups.length || !added.length ? 6000 : undefined);
     render();
   }
   sheet.returnValue = '';
@@ -836,7 +839,7 @@ function importFromHash() {
   try { text = decodeURIComponent(m[1].replace(/\+/g, ' ')); } catch { text = m[1]; }
   if (!state.settings.income) return toast('Set your monthly income first, then the message will be counted next time.');
   const p = importMessage(text);
-  if (p === 'dup') return toast('Already added that one');
+  if (p?.dup) return toast(`Already added: ${p.dup.name} ${inr(p.dup.amount)} (${shortDate(p.dup.date)})`);
   if (!p) return toast("No debit found in that message — nothing added");
   tab = 'today';
   render();
@@ -848,12 +851,12 @@ window.addEventListener('hashchange', importFromHash);
 /* ================= Misc ================= */
 
 let toastTimer;
-function toast(msg) {
+function toast(msg, ms = 2600) {
   const el = $('#toast');
   el.textContent = msg;
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+  toastTimer = setTimeout(() => el.classList.remove('show'), ms);
 }
 
 function exportCsv() {
