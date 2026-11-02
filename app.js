@@ -160,7 +160,58 @@ function parseSms(text) {
   name = name.replace(/[._\-]+/g, ' ').replace(/\s+/g, ' ').trim() || 'UPI payment';
   name = name.length > 22 ? name.slice(0, 22) : name;
   const method = /card/i.test(text) ? 'Card' : /atm|withdrawn/i.test(text) ? 'Cash' : 'UPI';
-  return { name: titleCase(name), amount, method, category: guessCategory(name) };
+  return { name: titleCase(name), amount, method, category: guessCategory(name), date: dateInText(text) };
+}
+
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
+/**
+ * The date a bank alert mentions ("on 01-11-26", "02-Nov-26", "2026-11-01", "1 Nov 2026"),
+ * so old alerts pasted in later land on the right day. Falls back to today.
+ */
+function dateInText(text) {
+  const today = todayKey();
+  const yr = (y) => (y.length === 2 ? 2000 + Number(y) : Number(y));
+  const tryKey = (y, m, d) => {
+    if (!(m >= 1 && m <= 12 && d >= 1 && d <= 31)) return null;
+    const k = `${y}-${pad(m)}-${pad(d)}`;
+    return k <= today && daysBetween(k, today) <= 92 ? k : null;
+  };
+  let m;
+  if ((m = text.match(/\b(20\d\d)-(\d\d)-(\d\d)\b/))) return tryKey(+m[1], +m[2], +m[3]) || today;
+  if ((m = text.match(/\b(\d{1,2})[-\/ ]([A-Za-z]{3})[a-z]*[-\/ ,]+(\d{2,4})\b/))) {
+    const mon = MONTHS.indexOf(m[2].toLowerCase()) + 1;
+    if (mon) return tryKey(yr(m[3]), mon, +m[1]) || today;
+  }
+  if ((m = text.match(/\b(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})\b/))) return tryKey(yr(m[3]), +m[2], +m[1]) || today;
+  return today;
+}
+
+/**
+ * Splits a big paste into individual alerts: blank-line separated blocks (emails),
+ * and within a block, one alert per line when several lines each hold a debit.
+ */
+function splitMessages(text) {
+  const out = [];
+  for (const block of String(text).split(/\n\s*\n/)) {
+    const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
+    const each = lines.filter((l) => parseSms(l));
+    if (each.length > 1) out.push(...each);
+    else if (block.trim()) out.push(block.trim());
+  }
+  return out;
+}
+
+/** Adds one alert unless it was already imported (by shortcut or paste). Returns the spend, 'dup' or null. */
+function importMessage(text) {
+  const fp = fingerprint(text);
+  if (state.seenSms.includes(fp)) return 'dup';
+  const p = parseSms(text);
+  if (!p) return null;
+  addTxn(p);
+  state.seenSms = [...state.seenSms, fp].slice(-500);
+  save();
+  return p;
 }
 
 const titleCase = (s) => s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
@@ -170,6 +221,8 @@ const titleCase = (s) => s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()
 function addTxn({ name, category, amount, method = 'UPI', date = todayKey() }) {
   amount = Number(amount);
   if (!name || !(amount > 0)) return false;
+  // Backfilled spends from before setup still count towards this month.
+  if (state.settings.startDate && date < state.settings.startDate) state.settings.startDate = date;
   const now = new Date();
   state.txns.push({
     id: crypto.randomUUID?.() || String(Date.now() + Math.random()),
@@ -469,7 +522,9 @@ function renderSettings() {
         <li>Add <b>URL Encode</b>, input = <b>Shortcut Input</b> (tap it and pick the message <b>Content</b>).</li>
         <li>Add <b>Open URLs</b> with the link above, then insert the <b>URL Encoded Text</b> variable right after <code>#sms=</code>.</li>
         <li>For bank emails do the same with the <b>Email</b> trigger (Subject contains <code>debited</code>, or Sender is your bank's alert address), picking the email's <b>Body</b>.</li>
+        <li>Nightly summary: add a <b>Time of Day</b> automation (e.g. 9 PM) that just opens this app's link. The good/bad-day card is waiting on the Today tab.</li>
       </ol>
+      <p class="sub"><b>Older alerts:</b> shortcuts only see new messages. For ones you already got, copy them from Messages / Mail, then use <b>Paste SMS</b> on the Today tab and paste them all at once.</p>
       <p class="sub">Open this app in <b>Safari</b> (bookmark it) rather than “Add to Home Screen”. iOS keeps home-screen apps' data separate, and shortcuts always open Safari. Each message is counted once, even if the link opens twice.</p>
       <button class="btn ghost" data-action="test-import">Try it with a sample message</button>
     </section>
@@ -552,8 +607,8 @@ function openAddSheet(prefill = {}) {
 function openSmsSheet() {
   sheet.innerHTML = `
     <form method="dialog" id="sms-form">
-      <h2>Paste a bank / UPI SMS</h2>
-      <p class="hint">We'll pull out the amount and merchant. Works with most HDFC, ICICI, SBI, Axis, GPay, PhonePe and Paytm alerts. Paste several at once, one per line.</p>
+      <h2>Paste bank / UPI alerts</h2>
+      <p class="hint">Paste one or many SMS or emails. Leave a blank line between emails. Each spend goes on the date written in the message, and anything already added is skipped.</p>
       <div class="field">
         <textarea name="sms" placeholder="Rs.250.00 debited from A/c XX1234 to VPA starbucks@hdfcbank on 02-11-26. UPI Ref 6312…" required></textarea>
       </div>
@@ -570,10 +625,13 @@ sheet.addEventListener('close', () => {
   if (form.id === 'add-form') {
     if (addTxn(data)) { toast(`−${inr(data.amount)} · ${data.name}`); render(); }
   } else if (form.id === 'sms-form') {
-    const lines = data.sms.split(/\n+/).map((l) => l.trim()).filter(Boolean);
-    const parsed = lines.map(parseSms).filter(Boolean);
-    parsed.forEach((p) => addTxn(p));
-    toast(parsed.length ? `Added ${parsed.length} spend${parsed.length > 1 ? 's' : ''} · ${inr(parsed.reduce((s, p) => s + p.amount, 0))}` : "Couldn't find a debit in that message");
+    const results = splitMessages(data.sms).map(importMessage);
+    const added = results.filter((r) => r && r !== 'dup');
+    const dups = results.filter((r) => r === 'dup').length;
+    const msg = added.length
+      ? `Added ${added.length} spend${added.length > 1 ? 's' : ''} · ${inr(added.reduce((s, p) => s + p.amount, 0))}`
+      : "Couldn't find a new debit in that";
+    toast(dups ? `${msg} · ${dups} already added` : msg);
     render();
   }
   sheet.returnValue = '';
@@ -628,13 +686,9 @@ function importFromHash() {
   let text;
   try { text = decodeURIComponent(m[1].replace(/\+/g, ' ')); } catch { text = m[1]; }
   if (!state.settings.income) return toast('Set your monthly income first, then the message will be counted next time.');
-  const fp = fingerprint(text);
-  if (state.seenSms.includes(fp)) return toast('Already added that one');
-  const p = parseSms(text);
+  const p = importMessage(text);
+  if (p === 'dup') return toast('Already added that one');
   if (!p) return toast("No debit found in that message — nothing added");
-  addTxn(p);
-  state.seenSms = [...state.seenSms, fp].slice(-300);
-  save();
   tab = 'today';
   render();
   toast(`Auto-added −${inr(p.amount)} · ${p.name}`);
