@@ -24,43 +24,49 @@ which goes green → yellow → red as it drains. At night you get a
 - **Month view** — calendar of good/bad days with totals.
 - **Insights** — spend by category, top merchants, and **subscriptions** (explicit or detected as
   the same merchant charging a similar amount in two or more months) with monthly/yearly cost.
-- CSV export, demo data, installable as a PWA, works offline. All data stays in the browser (localStorage).
+- CSV export, demo data, installable on the iPhone home screen.
 
 ## Run it
 
-No build step and no dependencies. Serve the folder with any static server:
+No build step and no dependencies beyond Python 3. On the PC, double-click **`start-server.cmd`**
+(or run `python server.py`). It prints the address to open on your phone, e.g. `http://192.168.0.5:5173`.
 
-```bash
-python -m http.server 5173
-```
-
-Then open http://localhost:5173. (Opening `index.html` directly also works, but the service worker —
-offline mode and notifications from the installed app — needs `http://localhost` or HTTPS.)
+`server.py` serves the app and keeps your data in `data.json` next to it (git-ignored), so the iPhone app,
+Safari and the PC all see the same spends. The first device that opens the app uploads what it already has.
+Served by any other static host instead, the app falls back to keeping data in that browser only.
 
 Settings → **Load demo data** fills ~40 days of sample spends so you can see the month and insights views.
 
-## iPhone: auto-add from SMS & email (no bank connection)
+## Install on iPhone
 
-iOS doesn't let any app read your messages, but a **Shortcuts automation** can pass each bank alert to the app:
+Open the address in **Safari** → **Share** → **Add to Home Screen**. It gets its own icon and opens full-screen.
 
-1. Shortcuts → Automation → **+** → **Message** → *Message Contains* `debited` → **Run Immediately**.
-2. Actions: **URL Encode** (Shortcut Input → Content) → **Open URLs** `https://<where-the-app-is-hosted>/#sms=<URL Encoded Text>`.
-3. Banks word alerts differently (HDFC UPI: `Sent Rs.…`, cards: `spent`), so make one automation per wording:
-   `debited`, `Sent Rs`, `spent`.
-4. Repeat with the **Email** trigger (subject contains `debited` or sender is your bank) using the email Body.
+## iPhone: auto-add from SMS & email in the background (no bank connection)
 
-The text travels in the URL fragment (`#…`), which browsers never send to the server. It's parsed on the phone.
-Balances ("Avl Bal Rs …") are ignored, credits are skipped, and the same message is never counted twice.
-The same steps are in the app under Settings, with a copy button for the link.
+iOS doesn't let apps read your messages, but a **Shortcuts automation** can send each bank alert to the PC.
+Nothing opens on the phone; you just get a notification like `−₹350 · Ravi Stores 2 / ₹2,983 left today`.
 
-The app must be reachable from the phone (static hosting such as GitHub Pages, or this PC's IP on the same Wi-Fi).
-Use it in Safari rather than "Add to Home Screen", because iOS gives home-screen apps separate storage and shortcuts open Safari.
+1. Shortcuts → Automation → **+** → **Message** → *Message Contains* `Sent Rs` → **Run Immediately** → New Blank Automation.
+2. **Get Contents of URL** → `http://<PC-IP>:5173/api/sms`, Method **POST**, Request Body **JSON**,
+   Text field `text` = **Shortcut Input › Content**.
+3. **Show Notification** → **Contents of URL**.
+4. Banks word alerts differently (HDFC UPI: `Sent Rs.…`, others: `debited`, cards: `spent`), so make one automation
+   per wording. For bank emails use the **Email** trigger and the email **Body**.
+5. Nightly summary: **Time of Day** automation → **Get Contents of URL** `http://<PC-IP>:5173/api/summary` →
+   **Show Notification**.
+
+Balances ("Avl Bal Rs …") are ignored, credits are skipped, the date in the message is used, and the same message is
+never counted twice. The steps, with copy buttons for both URLs, are also in the app under Settings.
+
+Older alerts (before the automation existed): copy them from Messages / Mail and use **Paste SMS** on the Today tab.
 
 ## Limits
 
-- On Android or desktop there's no automation hook, so it's paste-to-add there ("Paste SMS").
-- The nightly notification fires while the app/tab is open (or when you next open it after the set time).
-  Guaranteed delivery with the app closed would need a push server.
+- The PC must be on with the server running, and the phone on the same Wi-Fi. Alerts that arrive while you're
+  away show "Automation failed"; paste those in later.
+- Anyone on the same Wi-Fi who knows the address can open the app and its data. Fine at home; stop the server
+  on public Wi-Fi.
+- On Android there's no automation hook, so it's paste-to-add there ("Paste SMS").
 
 ## Files
 
@@ -68,6 +74,8 @@ Use it in Safari rather than "Add to Home Screen", because iOS gives home-screen
 | --- | --- |
 | `index.html` | App shell |
 | `styles.css` | Dark neon theme |
-| `app.js` | Budget engine, SMS parser, views, notifications |
+| `app.js` | Budget engine, SMS parser, views, sync with the server |
+| `server.py` | Serves the app, stores `data.json`, `/api/sms` and `/api/summary` for Shortcuts (parser mirrors `app.js`) |
+| `start-server.cmd` | Double-click launcher for Windows |
 | `sw.js` | Offline cache + notification clicks |
-| `manifest.webmanifest`, `icon.svg` | PWA install metadata |
+| `manifest.webmanifest`, `icon.svg`, `apple-touch-icon.png` | Home-screen install metadata and icons |

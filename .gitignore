@@ -1,0 +1,4 @@
+# Your spends live here (written by server.py); never commit them.
+data.json
+data.json.tmp
+__pycache__/

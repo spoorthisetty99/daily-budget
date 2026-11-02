@@ -26,7 +26,109 @@ function load() {
 }
 
 let state = load();
-const save = () => localStorage.setItem(STORE_KEY, JSON.stringify(state));
+
+/**
+ * Saves locally, and queues `ops` for the PC server (server.py) when there is one.
+ * Ops: {type:'add', txn} · {type:'delete', id} · {type:'settings', settings} · {type:'seen', fp} · {type:'replace', state}
+ */
+function save(...ops) {
+  localStorage.setItem(STORE_KEY, JSON.stringify(state));
+  if (ops.length && recordOps) queueOps(ops);
+}
+
+/* ================= Sync with the PC server ================= */
+
+const OUTBOX_KEY = 'daily-budget-outbox';
+let serverMode = false;   // true when served by server.py (has /api/state)
+let recordOps = true;     // off while bulk-building state (demo data)
+let outbox = [];
+try { outbox = JSON.parse(localStorage.getItem(OUTBOX_KEY)) || []; } catch { /* empty */ }
+const saveOutbox = () => localStorage.setItem(OUTBOX_KEY, JSON.stringify(outbox));
+const shareable = (s) => ({ settings: s.settings, txns: s.txns, seenSms: s.seenSms });
+
+function queueOps(ops) {
+  outbox.push(...ops);
+  saveOutbox();
+  queueMicrotask(flush); // batches everything saved in the same tick
+}
+
+/** Takes the server's state; keeps this device's own bookkeeping. Returns true if anything changed. */
+function adopt(remote) {
+  const next = {
+    ...DEFAULT_STATE,
+    ...remote,
+    settings: { ...DEFAULT_STATE.settings, ...remote.settings },
+    lastSummary: state.lastSummary,
+  };
+  const changed = JSON.stringify(shareable(next)) !== JSON.stringify(shareable(state));
+  state = next;
+  localStorage.setItem(STORE_KEY, JSON.stringify(state));
+  return changed;
+}
+
+let flushing = false;
+async function flush() {
+  if (!serverMode || flushing || !outbox.length) return;
+  flushing = true;
+  const ops = outbox.splice(0);
+  try {
+    const res = await fetch('api/ops', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ops }),
+    });
+    if (!res.ok) throw new Error(res.status);
+    if (adopt(await res.json()) && !isEditing()) render();
+  } catch {
+    outbox.unshift(...ops);
+    toast('Saved on this phone. It will sync when your PC is reachable.');
+  } finally {
+    saveOutbox();
+    flushing = false;
+  }
+}
+
+// Don't redraw under someone typing (the setup screen doesn't count: synced data replaces it).
+const isEditing = () =>
+  sheet.open ||
+  (view.contains(document.activeElement) &&
+    /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) &&
+    !document.activeElement.closest('#onboard-form'));
+
+/** Finds the server; on first contact moves this device's data up if the server has none. */
+async function connect() {
+  let res;
+  try {
+    res = await fetch('api/state', { cache: 'no-store' });
+  } catch {
+    return; // PC unreachable right now: keep working locally, outbox waits
+  }
+  if (!res.ok || !(res.headers.get('content-type') || '').includes('json')) {
+    outbox = []; // plain static hosting: nothing to sync with
+    saveOutbox();
+    return;
+  }
+  const remote = await res.json();
+  serverMode = true;
+  if (!remote.settings?.income && state.settings.income) {
+    outbox.unshift({ type: 'replace', state: shareable(state) });
+  } else if (!outbox.length) {
+    adopt(remote);
+  }
+  await flush();
+  if (!isEditing()) render();
+}
+
+/** Picks up spends the shortcut added in the background. */
+async function refresh() {
+  if (!serverMode) return connect();
+  await flush();
+  if (outbox.length) return;
+  try {
+    const res = await fetch('api/state', { cache: 'no-store' });
+    if (res.ok && adopt(await res.json()) && !isEditing()) render();
+  } catch { /* offline */ }
+}
 
 /* ================= Dates & money ================= */
 
@@ -210,7 +312,7 @@ function importMessage(text) {
   if (!p) return null;
   addTxn(p);
   state.seenSms = [...state.seenSms, fp].slice(-500);
-  save();
+  save({ type: 'seen', fp });
   return p;
 }
 
@@ -221,10 +323,14 @@ const titleCase = (s) => s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()
 function addTxn({ name, category, amount, method = 'UPI', date = todayKey() }) {
   amount = Number(amount);
   if (!name || !(amount > 0)) return false;
+  const ops = [];
   // Backfilled spends from before setup still count towards this month.
-  if (state.settings.startDate && date < state.settings.startDate) state.settings.startDate = date;
+  if (state.settings.startDate && date < state.settings.startDate) {
+    state.settings.startDate = date;
+    ops.push({ type: 'settings', settings: { startDate: date } });
+  }
   const now = new Date();
-  state.txns.push({
+  const txn = {
     id: crypto.randomUUID?.() || String(Date.now() + Math.random()),
     date,
     time: `${pad(now.getHours())}:${pad(now.getMinutes())}`,
@@ -232,14 +338,15 @@ function addTxn({ name, category, amount, method = 'UPI', date = todayKey() }) {
     category: category || guessCategory(name),
     method,
     amount,
-  });
-  save();
+  };
+  state.txns.push(txn);
+  save(...ops, { type: 'add', txn });
   return true;
 }
 
 function deleteTxn(id) {
   state.txns = state.txns.filter((t) => t.id !== id);
-  save();
+  save({ type: 'delete', id });
 }
 
 /* ================= Rendering ================= */
@@ -506,7 +613,9 @@ function renderSettings() {
       </form>
     </section>
 
-    <div class="label section-title">iPhone: auto-add from SMS &amp; email</div>
+    ${serverMode ? serverGuide() : ''}
+
+    <div class="label section-title">${serverMode ? 'Older method: open the app per alert' : 'iPhone: auto-add from SMS &amp; email'}</div>
     <section class="card guide">
       <p class="sub" style="margin-top:0">No bank login needed. An iPhone Shortcuts automation passes each “debited” alert to this app, which reads the amount on your phone. The message text is never sent to a server.</p>
       <div class="field">
@@ -526,7 +635,7 @@ function renderSettings() {
         <li>Nightly summary: add a <b>Time of Day</b> automation (e.g. 9 PM) that just opens this app's link. The good/bad-day card is waiting on the Today tab.</li>
       </ol>
       <p class="sub"><b>Older alerts:</b> shortcuts only see new messages. For ones you already got, copy them from Messages / Mail, then use <b>Paste SMS</b> on the Today tab and paste them all at once.</p>
-      <p class="sub">Open this app in <b>Safari</b> (bookmark it) rather than “Add to Home Screen”. iOS keeps home-screen apps' data separate, and shortcuts always open Safari. Each message is counted once, even if the link opens twice.</p>
+      ${serverMode ? '' : `<p class="sub">Open this app in <b>Safari</b> (bookmark it) rather than “Add to Home Screen”. iOS keeps home-screen apps' data separate, and shortcuts always open Safari. Each message is counted once, even if the link opens twice.</p>`}
       <button class="btn ghost" data-action="test-import">Try it with a sample message</button>
     </section>
 
@@ -537,8 +646,47 @@ function renderSettings() {
       <button class="btn ghost" data-action="demo">Load demo data</button>
       <button class="btn danger" data-action="reset">Erase everything</button>
     </section>
-    <p class="sub" style="text-align:center">Everything stays on this device (localStorage).</p>
+    <p class="sub" style="text-align:center">${serverMode
+      ? 'Your data is stored on your PC (data.json) and shared by every device that opens this app.'
+      : 'Everything stays on this device (localStorage).'}</p>
   `;
+}
+
+function serverGuide() {
+  const base = location.origin;
+  const copy = (id, value) => `
+    <div class="row" style="gap:8px;margin-bottom:10px">
+      <input id="${id}" readonly value="${esc(value)}" />
+      <button class="btn ghost" style="flex:none;width:auto;padding:0 16px" data-action="copy" data-copy="${id}">Copy</button>
+    </div>`;
+  return `
+    <div class="label section-title">Install as an app</div>
+    <section class="card guide">
+      <ol>
+        <li>Open <b>${esc(base)}</b> in <b>Safari</b> on your iPhone.</li>
+        <li>Tap <b>Share</b> → <b>Add to Home Screen</b> → <b>Add</b>.</li>
+      </ol>
+      <p class="sub">It opens full-screen from its own icon. Your data lives on your PC, so the app, Safari and your PC all show the same spends.</p>
+    </section>
+
+    <div class="label section-title">iPhone: auto-add in the background</div>
+    <section class="card guide">
+      <p class="sub" style="margin-top:0">Each bank alert is sent to your PC, which reads it and saves the spend. You get a notification and nothing opens.</p>
+      <label class="label">Alert URL</label>
+      ${copy('sms-api', base + '/api/sms')}
+      <ol>
+        <li><b>Shortcuts</b> → <b>Automation</b> → <b>+</b> → <b>Message</b> → Message Contains <code>Sent Rs</code> → <b>Run Immediately</b> → Next → <b>New Blank Automation</b>.</li>
+        <li>Add <b>Get Contents of URL</b>. Set the URL to the alert URL above. Tap <b>›</b> to show more: Method <b>POST</b>, Request Body <b>JSON</b>, add a <b>Text</b> field with key <code>text</code> and value <b>Shortcut Input › Content</b>.</li>
+        <li>Add <b>Show Notification</b> and set its text to <b>Contents of URL</b>.</li>
+        <li>Make the same automation for <code>debited</code> and <code>spent</code>. For bank emails, use the <b>Email</b> trigger and pick the email's <b>Body</b>.</li>
+      </ol>
+      <label class="label">Nightly summary URL</label>
+      ${copy('summary-api', base + '/api/summary')}
+      <ol start="5">
+        <li><b>Time of Day</b> automation (e.g. 9 PM, Run Immediately): <b>Get Contents of URL</b> with the summary URL, then <b>Show Notification</b> with <b>Contents of URL</b>.</li>
+      </ol>
+      <p class="sub">Your PC must be on with <code>start-server.cmd</code> running, and the phone on the same Wi-Fi. Alerts that arrive while you're away fail; paste those in later with <b>Paste SMS</b>.</p>
+    </section>`;
 }
 
 function renderOnboarding() {
@@ -730,6 +878,7 @@ function loadDemo() {
   state.settings.income = state.settings.income || 100000;
   state.settings.startDate = addDays(k, -40);
   state.txns = [];
+  recordOps = false; // sent as one 'replace' below instead of ~100 adds
   const rand = (n) => Math.floor(Math.random() * n);
   for (let i = 40; i >= 1; i--) {
     const d = addDays(k, -i);
@@ -745,7 +894,8 @@ function loadDemo() {
     if (parseKey(d).getDate() === 1) addTxn({ name: 'Rent', category: 'Bills', amount: 25000, method: 'Net banking', date: d });
   }
   if (day > 1) addTxn({ name: 'Coffee', category: 'Food & drink', amount: 250 });
-  save();
+  recordOps = true;
+  save({ type: 'replace', state: shareable(state) });
 }
 
 /* ================= Events ================= */
@@ -776,9 +926,14 @@ view.addEventListener('click', async (e) => {
     render();
   } else if (t.dataset.action === 'sms') openSmsSheet();
   else if (t.dataset.action === 'export') exportCsv();
-  else if (t.dataset.action === 'copy-link') {
-    const v = $('#sms-link').value;
-    try { await navigator.clipboard.writeText(v); toast('Link copied'); } catch { $('#sms-link').select(); }
+  else if (t.dataset.action === 'copy-link' || t.dataset.action === 'copy') {
+    const input = $('#' + (t.dataset.copy || 'sms-link'));
+    try { await navigator.clipboard.writeText(input.value); toast('Copied'); } catch {
+      // Plain http on the Wi-Fi has no clipboard API; fall back to the old copy command.
+      input.select();
+      input.setSelectionRange(0, 9999);
+      toast(document.execCommand('copy') ? 'Copied' : 'Select the text and copy it');
+    }
   } else if (t.dataset.action === 'test-import') {
     const sample = `Rs.250.00 debited from A/c XX1234 on ${todayKey()} to VPA starbucks@hdfcbank. UPI Ref ${Date.now() % 1e9}. Avl Bal Rs.42,310.00`;
     location.hash = 'sms=' + encodeURIComponent(sample);
@@ -786,7 +941,13 @@ view.addEventListener('click', async (e) => {
   else if (t.dataset.action === 'demo') {
     if (!state.txns.length || confirm('Replace your transactions with ~40 days of demo data?')) { loadDemo(); toast('Demo data loaded'); tab = 'today'; render(); }
   } else if (t.dataset.action === 'reset') {
-    if (confirm('Erase all settings and transactions on this device?')) { localStorage.removeItem(STORE_KEY); state = load(); tab = 'today'; render(); }
+    if (confirm(serverMode ? 'Erase all settings and transactions (on your PC and every device)?' : 'Erase all settings and transactions on this device?')) {
+      localStorage.removeItem(STORE_KEY);
+      state = load();
+      save({ type: 'replace', state: shareable(state) });
+      tab = 'today';
+      render();
+    }
   } else if (t.dataset.action === 'test-notify') {
     if ('Notification' in window && Notification.permission === 'default') await Notification.requestPermission();
     const s = summaryFor(todayKey());
@@ -800,7 +961,7 @@ view.addEventListener('submit', async (e) => {
   if (e.target.id === 'onboard-form') {
     state.settings.income = Number(data.income);
     state.settings.startDate = todayKey();
-    save();
+    save({ type: 'settings', settings: { income: state.settings.income, startDate: state.settings.startDate } });
     tab = 'today';
     render();
   } else if (e.target.id === 'settings-form') {
@@ -812,7 +973,7 @@ view.addEventListener('submit', async (e) => {
     if (s.notify && 'Notification' in window && Notification.permission === 'default') {
       s.notify = (await Notification.requestPermission()) === 'granted';
     }
-    save();
+    save({ type: 'settings', settings: { income: s.income, rollover: s.rollover, reminderTime: s.reminderTime, notify: s.notify } });
     toast('Saved');
     render();
   }
@@ -823,9 +984,12 @@ let lastKey = todayKey();
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible') return;
   checkNightly();
+  refresh();
   if (todayKey() !== lastKey) { lastKey = todayKey(); render(); }
 });
+setInterval(() => document.visibilityState === 'visible' && refresh(), 10_000);
 
 render();
 importFromHash();
 checkNightly();
+connect();

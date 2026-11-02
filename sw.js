@@ -1,6 +1,6 @@
 // Offline cache + notification click handling.
 const CACHE = 'daily-budget-v1';
-const ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'icon.svg', 'manifest.webmanifest'];
+const ASSETS = ['./', 'index.html', 'styles.css', 'app.js', 'icon.svg', 'apple-touch-icon.png', 'manifest.webmanifest'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)));
@@ -17,7 +17,8 @@ self.addEventListener('activate', (e) => {
 
 // Network first so edits show up immediately; fall back to cache offline.
 self.addEventListener('fetch', (e) => {
-  if (e.request.method !== 'GET' || new URL(e.request.url).origin !== location.origin) return;
+  const url = new URL(e.request.url);
+  if (e.request.method !== 'GET' || url.origin !== location.origin || url.pathname.startsWith('/api/')) return;
   e.respondWith(
     fetch(e.request)
       .then((res) => {

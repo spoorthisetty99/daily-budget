@@ -36,7 +36,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .app {
   max-width: 480px;
   margin: 0 auto;
-  padding: 16px 16px 110px;
+  padding: calc(16px + env(safe-area-inset-top)) 16px calc(110px + env(safe-area-inset-bottom));
 }
 
 .topbar { padding: 8px 0 16px; }
@@ -259,7 +259,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .fab {
   position: fixed;
   right: max(16px, calc(50vw - 240px + 16px));
-  bottom: 86px;
+  bottom: calc(86px + env(safe-area-inset-bottom));
   width: 58px; height: 58px;
   border-radius: 50%;
   border: 0;
@@ -290,8 +290,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .toast {
   position: fixed;
   left: 50%;
-  top: 16px;
-  transform: translate(-50%, -150%);
+  top: calc(16px + env(safe-area-inset-top));
+  transform: translate(-50%, -300%);
   background: var(--card-2);
   border: 1px solid var(--line);
   padding: 12px 18px;
