@@ -1382,9 +1382,15 @@ function renderSettings() {
       <button class="btn ghost" data-action="demo">Load demo data</button>
       <button class="btn danger" data-action="reset">Erase everything</button>
     </section>
-    <p class="sub" style="text-align:center">${serverMode
-      ? 'Your data is stored on your PC (data.json) and shared by every device that opens this app.'
-      : 'Everything stays on this device (localStorage).'}</p>
+    ${userName ? `
+      <div class="label section-title">Account</div>
+      <section class="card">
+        <p class="sub" style="margin-top:0">Logged in as <b>${esc(userName)}</b>. Logging out removes your data from this phone only; it stays safe on the server.</p>
+        <button class="btn ghost" data-action="sign-out">Log out</button>
+      </section>` : ''}
+    <p class="sub" style="text-align:center">${!serverMode ? 'Everything stays on this device (localStorage).'
+      : userName ? 'Your data is stored on the server, under your login, and shared by every device you log in on.'
+      : 'Your data is stored on your PC (data.json) and shared by every device that opens this app.'}</p>
   `;
 }
 
