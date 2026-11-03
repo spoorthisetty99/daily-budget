@@ -542,6 +542,20 @@ function txnHtml(t, { withDate } = {}) {
     </div>`;
 }
 
+/** Everything in your savings accounts, on Today; a tap opens the Money tab. */
+function bankTotalRow() {
+  const accounts = state.settings.accounts || [];
+  return `
+    <button class="bank-total" data-goto="money">
+      <span class="ico">${svgIcon('bank')}</span>
+      <span class="meta">
+        <span class="label">In your banks</span>
+        <span class="sub">${accounts.length ? esc(accounts.map((a) => a.name).join(' · ')) : 'Add your accounts and balances'}</span>
+      </span>
+      <span class="amt">${accounts.length ? inr(sumOf(accounts, (a) => a.balance)) : 'Add ›'}</span>
+    </button>`;
+}
+
 function renderToday() {
   const k = todayKey();
   const budget = budgetFor(k);
@@ -573,6 +587,8 @@ function renderToday() {
           : `of ${inr(budget)} today · ${fixedTotal() ? `(${inr(state.settings.income)} − ${inr(fixedTotal())} fixed)` : inr(state.settings.income)} ÷ ${daysInMonth(k)} days${state.settings.rollover && Math.round(budget) !== Math.round(baseDaily(k)) ? ' (adjusted)' : ''}`}
       </div>
     </section>
+
+    ${bankTotalRow()}
 
     <button class="btn paste-cta" data-action="sms">📩 Paste SMS</button>
 
@@ -1774,6 +1790,10 @@ view.addEventListener('click', async (e) => {
   } else if (t.dataset.trend) {
     trendMode = t.dataset.trend;
     render();
+  } else if (t.dataset.goto) {
+    tab = t.dataset.goto;
+    render();
+    window.scrollTo({ top: 0 });
   } else if (t.dataset.action === 'sms') openSmsSheet();
   else if (t.dataset.action === 'export') exportCsv();
   else if (t.dataset.action === 'add-fixed') openFixedSheet();

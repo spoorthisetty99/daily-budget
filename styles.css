@@ -302,6 +302,16 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .btn.danger { background: transparent; color: var(--red); border: 1px solid color-mix(in srgb, var(--red) 40%, transparent); }
 .btn + .btn { margin-top: 10px; }
 .paste-cta { margin-top: 12px; }
+.bank-total {
+  width: 100%; margin-top: 12px; display: flex; align-items: center; gap: 12px; text-align: left;
+  background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 12px 14px;
+}
+.bank-total:hover { border-color: var(--purple); }
+.bank-total .ico { flex: none; width: 36px; height: 36px; padding: 8px; border-radius: 10px; background: var(--purple-soft); color: var(--text); }
+.bank-total .ico svg { width: 100%; height: 100%; display: block; }
+.bank-total .meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.bank-total .sub { font-size: 12px; color: var(--muted); margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bank-total .amt { font-size: 20px; font-weight: 900; white-space: nowrap; }
 
 .segmented { display: flex; background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 4px; margin-bottom: 16px; }
 .segmented button { flex: 1; border: 0; background: none; padding: 8px; border-radius: 9px; font-weight: 600; font-size: 14px; color: var(--muted); }
