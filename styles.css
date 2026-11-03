@@ -302,6 +302,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .btn.danger { background: transparent; color: var(--red); border: 1px solid color-mix(in srgb, var(--red) 40%, transparent); }
 .btn + .btn { margin-top: 10px; }
 .paste-cta { margin-top: 12px; }
+.signed-in { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 14px; margin-bottom: 14px; }
+.signed-in .btn { width: auto; padding: 8px 14px; font-size: 14px; }
 .bank-total {
   width: 100%; margin-top: 12px; display: flex; align-items: center; gap: 12px; text-align: left;
   background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 12px 14px;

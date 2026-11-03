@@ -50,11 +50,36 @@ try { outbox = JSON.parse(localStorage.getItem(OUTBOX_KEY)) || []; } catch { /* 
 const saveOutbox = () => localStorage.setItem(OUTBOX_KEY, JSON.stringify(outbox));
 const shareable = (s) => ({ settings: s.settings, txns: s.txns, seenSms: s.seenSms });
 
-// The app key (BUDGET_KEY on the server) guards your data once the app is on the internet.
+// The app key guards your data once the app is on the internet: with logins it is your personal
+// key (handed out by api/login), otherwise the server's BUDGET_KEY.
 const APPKEY_KEY = 'daily-budget-key';
+const USER_KEY = 'daily-budget-user';
 let appKey = '';
-try { appKey = localStorage.getItem(APPKEY_KEY) || ''; } catch { /* private mode */ }
+let userName = '';
+try { appKey = localStorage.getItem(APPKEY_KEY) || ''; userName = localStorage.getItem(USER_KEY) || ''; } catch { /* private mode */ }
 let needKey = false;
+let loginMode = false; // the server has users: ask for a username and password, not a key
+
+async function checkLoginMode() {
+  try { loginMode = !!(await (await fetch('api/auth', { cache: 'no-store' })).json()).users; } catch { /* offline */ }
+}
+
+/** Forgets this device's copy of someone's data, so the next person starts from their own. */
+function forgetLocalData() {
+  localStorage.removeItem(STORE_KEY);
+  state = load();
+  outbox = [];
+  saveOutbox();
+}
+
+function signOut() {
+  forgetLocalData();
+  appKey = userName = '';
+  try { localStorage.removeItem(APPKEY_KEY); localStorage.removeItem(USER_KEY); } catch { /* private mode */ }
+  serverMode = false;
+  needKey = true;
+  render();
+}
 const api = (path, opts = {}) =>
   fetch(path, { ...opts, headers: { ...(opts.headers || {}), ...(appKey ? { 'X-Budget-Key': appKey } : {}) } });
 
@@ -106,7 +131,7 @@ const isEditing = () =>
   sheet.open ||
   (view.contains(document.activeElement) &&
     /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) &&
-    !document.activeElement.closest('#onboard-form, #key-form'));
+    !document.activeElement.closest('#onboard-form, #key-form, #login-form'));
 
 /** Finds the server; on first contact moves this device's data up if the server has none. */
 async function connect() {
@@ -117,8 +142,11 @@ async function connect() {
     return; // server unreachable right now: keep working locally, outbox waits
   }
   if (res.status === 401) {
-    needKey = true; // the server has a key and we don't have the right one
-    return render();
+    // The server has a key and we don't have the right one. Don't redraw a login form being typed into.
+    const showing = needKey && document.querySelector('#login-form, #key-form');
+    needKey = true;
+    await checkLoginMode();
+    return showing ? undefined : render();
   }
   needKey = false;
   if (!res.ok || !(res.headers.get('content-type') || '').includes('json')) {
@@ -144,7 +172,7 @@ async function refresh() {
   if (outbox.length) return;
   try {
     const res = await api('api/state', { cache: 'no-store' });
-    if (res.status === 401) { needKey = true; serverMode = false; return render(); }
+    if (res.status === 401) { needKey = true; serverMode = false; await checkLoginMode(); return render(); }
     if (res.ok && adopt(await res.json()) && !isEditing()) render();
   } catch { /* offline */ }
 }
@@ -1286,6 +1314,11 @@ function renderSettings() {
   const s = state.settings;
   const perm = 'Notification' in window ? Notification.permission : 'unsupported';
   view.innerHTML = `
+    ${userName ? `
+      <section class="card signed-in">
+        <span>Logged in as <b>${esc(userName)}</b></span>
+        <button class="btn ghost" data-action="sign-out">Log out</button>
+      </section>` : ''}
     <section class="card">
       <form id="settings-form">
         <div class="field">
@@ -1407,6 +1440,7 @@ function serverGuide() {
 
 function renderKeyPrompt() {
   $('#fab').style.display = 'none';
+  if (loginMode) return renderLogin();
   view.innerHTML = `
     <section class="card">
       <div class="label">Locked</div>
@@ -1419,6 +1453,45 @@ function renderKeyPrompt() {
         <button class="btn" type="submit">Unlock</button>
       </form>
     </section>`;
+}
+
+function renderLogin() {
+  view.innerHTML = `
+    <section class="card">
+      <div class="label">Welcome</div>
+      <h2 style="font-size:24px;font-weight:900;margin:8px 0 6px">Log in</h2>
+      <p class="sub" style="margin-top:0">Each person sees only their own spends. You stay logged in on this phone.</p>
+      <form id="login-form" style="margin-top:16px">
+        <div class="field">
+          <label class="label" for="l-user">Username</label>
+          <input id="l-user" name="username" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" value="${esc(userName)}" required />
+        </div>
+        <div class="field">
+          <label class="label" for="l-pass">Password</label>
+          <input id="l-pass" name="password" type="password" autocomplete="current-password" required />
+        </div>
+        <button class="btn" type="submit">Log in</button>
+      </form>
+    </section>`;
+  $(userName ? '#l-pass' : '#l-user').focus();
+}
+
+async function logIn({ username, password }) {
+  let res;
+  try {
+    res = await fetch('api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+  } catch {
+    return toast("Can't reach the server right now");
+  }
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) return toast(out.error || "Couldn't log in");
+  // Someone else used this phone before: start from this person's own data, never theirs.
+  if (out.user !== userName) forgetLocalData();
+  appKey = out.key;
+  userName = out.user;
+  try { localStorage.setItem(APPKEY_KEY, appKey); localStorage.setItem(USER_KEY, userName); } catch { /* private mode */ }
+  tab = 'today';
+  await connect();
 }
 
 function renderOnboarding() {
@@ -1797,6 +1870,9 @@ view.addEventListener('click', async (e) => {
   } else if (t.dataset.action === 'sms') openSmsSheet();
   else if (t.dataset.action === 'export') exportCsv();
   else if (t.dataset.action === 'add-fixed') openFixedSheet();
+  else if (t.dataset.action === 'sign-out') {
+    if (confirm('Log out on this phone? Your data stays safe on the server.')) signOut();
+  }
   else if (t.dataset.action === 'add-account') openAccountSheet();
   else if (t.dataset.action === 'add-invest') openInvestSheet();
   else if (t.dataset.action === 'add-credit') openAddSheet({ kind: 'credit' });
@@ -1833,6 +1909,7 @@ view.addEventListener('click', async (e) => {
 view.addEventListener('submit', async (e) => {
   e.preventDefault();
   const data = Object.fromEntries(new FormData(e.target));
+  if (e.target.id === 'login-form') return logIn(data);
   if (e.target.id === 'key-form') {
     appKey = String(data.key || '').trim();
     try { localStorage.setItem(APPKEY_KEY, appKey); } catch { /* private mode */ }

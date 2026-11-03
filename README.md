@@ -52,28 +52,48 @@ PythonAnywhere's free plan stays on, keeps files, and gives you HTTPS (needed to
 2. **Consoles → Bash**, then:
    ```bash
    git clone https://github.com/spoorthisetty99/daily-budget.git
-   python3 -c "import secrets; print(secrets.token_urlsafe(24))"
    ```
    The repo is private, so git asks for your GitHub username and a password: use a **personal access token**
    (GitHub → Settings → Developer settings → Fine-grained tokens → only this repo, *Contents: Read-only*).
-   The second line prints a random **app key**. Save it in your password manager.
-3. **Files** → open `daily-budget/` → **Upload a file** → your PC's `Desktop\expense\data.json` (this moves your spends over).
-4. **Web → Add a new web app → Manual configuration →** the newest Python 3.
-5. On the Web tab, open the **WSGI configuration file** link, delete everything in it, and paste (with your
-   username and key):
+3. **Files** → open `daily-budget/` → **Upload a file** → your PC's `Desktop\expense\data.json` (your spends so far).
+4. Back in the Bash console, create the logins (each asks for a password, twice):
+   ```bash
+   cd daily-budget
+   python3 server.py adduser spoorthi --import data.json
+   python3 server.py adduser <friend>
+   ```
+   The first one starts from your uploaded spends; the second starts empty, a clean slate. Each prints that
+   person's **app key** for their phone automations (`python3 server.py users` shows them again).
+5. **Web → Add a new web app → Manual configuration →** the newest Python 3.
+6. On the Web tab, open the **WSGI configuration file** link, delete everything in it, and paste (with your username):
    ```python
-   import os, sys
-   os.environ['BUDGET_KEY'] = 'paste-your-app-key-here'
+   import sys
    sys.path.insert(0, '/home/<username>/daily-budget')
    from server import application
    ```
    Save, turn on **Force HTTPS**, and press **Reload**.
-6. Open `https://<username>.pythonanywhere.com` on your phone and enter the app key once.
-7. Point your phone automations at `https://<username>.pythonanywhere.com/api/sms` (and `/api/summary`) and add
-   the header `X-Budget-Key: <app key>`. Settings in the app shows both, with copy buttons.
+7. Open `https://<username>.pythonanywhere.com` on each phone and log in once.
+8. Point each phone's automations at `https://<username>.pythonanywhere.com/api/sms` (and `/api/summary`) with the
+   header `X-Budget-Key: <that person's app key>`. Settings in the app shows both, with copy buttons.
 
 Updating later: in a Bash console, `cd daily-budget && git pull`, then **Reload** on the Web tab.
 Free plan housekeeping: every 3 months, press **"Run until 3 months from today"** on the Web tab.
+
+## Logins
+
+Every person has a username and password and sees only their own spends, banks and investments (stored in
+`data/<name>.json`, next to `users.json`; both git-ignored and never served). There is no sign-up page: you
+create logins in a console, so strangers can't make accounts.
+
+```bash
+python3 server.py adduser NAME                     # new, empty account
+python3 server.py adduser NAME --import data.json  # starting from an existing data file
+python3 server.py passwd NAME                      # change a password (automations keep working)
+python3 server.py users                            # list users and their app keys
+```
+
+Logging in gives the phone that person's app key, which their automations also use. **Log out** is in Settings.
+With no users created, the app runs as before: one shared `data.json`, guarded by `BUDGET_KEY` if that is set.
 
 ## Install on your phone
 
@@ -91,7 +111,7 @@ Android has no Shortcuts app; the free **MacroDroid** app does the same job.
 2. **Action: HTTP Request** → POST `https://<username>.pythonanywhere.com/api/sms`, body content type
    `text/plain`, body `[sms_message]`, header `X-Budget-Key` = your app key. Save the response into a text variable.
 3. **Action: Display Notification** → text = that variable.
-4. Make the same macro for `debited` and `spent` (the free plan allows 5 macros).
+4. Make the same macro for `debited`, `spent` and `credited` (the free plan allows 5 macros).
 5. Nightly summary: a **Day/Time** trigger at 9 PM → HTTP Request **GET** `/api/summary` (same header) → notification.
 
 ## iPhone: auto-add from SMS & email in the background (no bank connection)
@@ -108,8 +128,8 @@ Nothing opens on the phone; you just get a notification like `−₹350 · Ravi 
 5. Nightly summary: **Time of Day** automation → **Get Contents of URL** `http://<PC-IP>:5173/api/summary` →
    **Show Notification**.
 
-Balances ("Avl Bal Rs …") are ignored, credits are skipped, the date in the message is used, and the same message is
-never counted twice. The steps, with copy buttons for both URLs, are also in the app under Settings.
+Balances ("Avl Bal Rs …") are ignored, credits go under Money received, the date in the message is used, and the
+same message is never counted twice. The steps, with copy buttons for both URLs, are also in the app under Settings.
 
 Older alerts (before the automation existed): copy them from Messages / Mail and use **Paste SMS** on the Today tab.
 
@@ -118,8 +138,7 @@ Older alerts (before the automation existed): copy them from Messages / Mail and
 - PC mode: the PC must be on with the server running, and the phone on the same Wi-Fi. Alerts that arrive while
   you're away show "Automation failed"; paste those in later. Anyone on the same Wi-Fi who knows the address can
   open the app (set `BUDGET_KEY` before starting the server to require the key there too).
-- Hosted mode: everything under `/api/` needs the app key. Keep it private; if it leaks, change it in the WSGI
-  file, Reload, and enter the new key on each device and automation.
+- Hosted mode: everything under `/api/` needs a login (or its app key). Keep app keys private.
 
 ## Files
 

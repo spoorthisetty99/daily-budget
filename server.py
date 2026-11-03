@@ -12,17 +12,29 @@ API (used by the app and the phone automations):
                       saves the spend and answers with a one-line notification text
   GET  /api/summary   tonight's good/bad-day summary as plain text
 
-When BUDGET_KEY is set, every /api/ call needs it, in an X-Budget-Key header (or ?key=).
+  GET  /api/auth      {"users": true} when people log in with a username and password
+  POST /api/login     {"username", "password"} → {"user", "key"}
+
+Logins: `python server.py adduser NAME` creates a user (see `python server.py help`). Each user
+gets their own data file in data/ and their own key; every /api/ call then needs that key, in an
+X-Budget-Key header (or ?key=), and only sees that user's data. With no users, there's one shared
+data.json, guarded by BUDGET_KEY when that is set.
 
 The SMS parser and budget maths mirror app.js; keep the two in sync.
 """
 import calendar
+import contextvars
+import getpass
+import hashlib
 import hmac
 import json
 import os
 import re
+import secrets
 import socket
+import sys
 import threading
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,8 +43,11 @@ from urllib.parse import parse_qs, urlparse
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get('BUDGET_DATA') or os.path.join(ROOT, 'data.json')
 PORT = int(os.environ.get('PORT', 5173))
-KEY = os.environ.get('BUDGET_KEY', '')  # required once the app is on the internet
+KEY = os.environ.get('BUDGET_KEY', '')  # single-user mode: required once the app is on the internet
+USERS = os.environ.get('BUDGET_USERS') or os.path.join(ROOT, 'users.json')
+DATA_DIR = os.environ.get('BUDGET_DATA_DIR') or os.path.join(ROOT, 'data')
 LOCK = threading.Lock()
+CURRENT = contextvars.ContextVar('data_file', default=DATA)  # the signed-in user's file, per request
 
 # Hosts usually run on UTC; spends must land on the right Indian day.
 try:
@@ -58,7 +73,7 @@ DEFAULT_SETTINGS = {'income': 0, 'rollover': True, 'reminderTime': '21:00', 'not
 
 def load():
     try:
-        with open(DATA, encoding='utf-8') as f:
+        with open(CURRENT.get(), encoding='utf-8') as f:
             s = json.load(f)
     except (FileNotFoundError, ValueError):
         s = {}
@@ -69,11 +84,61 @@ def load():
     }
 
 
-def store(s):
-    tmp = DATA + '.tmp'
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(s, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, DATA)
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def store(s):
+    write_json(CURRENT.get(), s)
+
+
+# ================= Users =================
+
+def users():
+    """{name: {"salt", "hash", "key"}} from users.json; empty means single-user mode."""
+    try:
+        with open(USERS, encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def user_file(name):
+    return os.path.join(DATA_DIR, f'{name}.json')
+
+
+def hash_password(password, salt):
+    return hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+def data_file_for(key):
+    """The data file this app key opens, or None if the key is wrong."""
+    key = key.strip()
+    accounts = users()
+    if not accounts:
+        return DATA if not KEY or hmac.compare_digest(key.encode(), KEY.encode()) else None
+    for name, u in accounts.items():
+        if key and hmac.compare_digest(key.encode(), u['key'].encode()):
+            return user_file(name)
+    return None
+
+
+def login(raw):
+    """(status, body) for POST /api/login."""
+    try:
+        d = json.loads(raw)
+        name, password = str(d['username']).strip().lower(), str(d['password'])
+    except (ValueError, KeyError, TypeError):
+        return 400, {'error': 'Bad request'}
+    u = users().get(name)
+    if not u or not hmac.compare_digest(hash_password(password, u['salt']), u['hash']):
+        time.sleep(1)  # slows down password guessing
+        return 401, {'error': 'Wrong username or password.'}
+    return 200, {'user': name, 'key': u['key']}
 
 
 # ================= Dates & money =================
@@ -474,22 +539,22 @@ TYPES = {  # explicit, since Windows' registry can map .js to text/plain
 }
 
 
-def key_ok(headers, query):
-    if not KEY:
-        return True
-    given = headers.get('x-budget-key') or (parse_qs(query).get('key') or [''])[0]
-    return hmac.compare_digest(given.strip().encode(), KEY.encode())
-
-
 def respond(method, target, headers, body):
     """One request → (status, content type, body bytes). Shared by the PC server and WSGI.
     `headers` is a dict with lower-case names."""
     url = urlparse(target)
     path = url.path
     if path.startswith('/api/'):
-        if not key_ok(headers, url.query):
-            return 401, TEXT, b'Wrong or missing app key. Add the X-Budget-Key header (Settings in the app shows it).'
         raw = body.decode('utf-8', 'replace')
+        if path == '/api/auth':
+            return 200, JSON, json.dumps({'users': bool(users())}).encode()
+        if method == 'POST' and path == '/api/login':
+            status, out = login(raw)
+            return status, JSON, json.dumps(out).encode()
+        file = data_file_for(headers.get('x-budget-key') or (parse_qs(url.query).get('key') or [''])[0])
+        if not file:
+            return 401, TEXT, b'Wrong or missing app key. Add the X-Budget-Key header (Settings in the app shows it).'
+        CURRENT.set(file)
         if method == 'GET' and path == '/api/state':
             return 200, JSON, json.dumps(load(), ensure_ascii=False).encode()
         if method == 'GET' and path == '/api/summary':
@@ -574,7 +639,61 @@ def lan_ip():
         s.close()
 
 
+HELP = """Users (each gets their own data and their own login):
+  python server.py adduser NAME                    create a login; asks for a password
+  python server.py adduser NAME --import data.json  same, starting from an existing data file
+  python server.py passwd NAME                     change a password (the app key stays the same)
+  python server.py users                           list users and their app keys
+"""
+
+
+def ask_password():
+    while True:
+        p = getpass.getpass('Password (at least 8 characters): ')
+        if len(p) < 8:
+            print('Too short.')
+        elif p != getpass.getpass('Same password again: '):
+            print("They don't match.")
+        else:
+            return p
+
+
+def cli(args):
+    accounts = users()
+    cmd, name = args[0], (args[1].strip().lower() if len(args) > 1 else '')
+    if cmd == 'users':
+        for n, u in accounts.items():
+            print(f'{n}: app key {u["key"]}')
+        return print('No users yet: the app is in single-user mode.') if not accounts else None
+    if cmd not in ('adduser', 'passwd') or not re.fullmatch(r'[a-z0-9_-]{2,20}', name):
+        return print(HELP)
+    if cmd == 'passwd':
+        if name not in accounts:
+            return print(f'No user called {name}.')
+        salt = secrets.token_hex(16)
+        accounts[name].update(salt=salt, hash=hash_password(ask_password(), salt))
+        write_json(USERS, accounts)
+        return print(f'Password changed for {name}.')
+    if name in accounts:
+        return print(f'{name} already exists. To change the password: python server.py passwd {name}')
+    source = args[args.index('--import') + 1] if '--import' in args[:-1] else None
+    if source and not os.path.exists(source):
+        return print(f'{source} not found.')
+    salt = secrets.token_hex(16)
+    accounts[name] = {'salt': salt, 'hash': hash_password(ask_password(), salt), 'key': secrets.token_urlsafe(24)}
+    if source and not os.path.exists(user_file(name)):
+        with open(source, encoding='utf-8') as f:
+            write_json(user_file(name), json.load(f))
+    write_json(USERS, accounts)
+    print(f'Created {name}{" with the data from " + source if source else " (empty, a clean start)"}.')
+    print(f'App key, for their phone automations: {accounts[name]["key"]}')
+    if len(accounts) == 1:
+        print('From now on everyone logs in with a username and password (no restart needed).')
+
+
 if __name__ == '__main__':
+    if len(sys.argv) > 1:
+        sys.exit(cli(sys.argv[1:]))
     ip = lan_ip()
     print('Daily Budget is running. Keep this window open.')
     print(f'  On your iPhone (same Wi-Fi): http://{ip}:{PORT}')
