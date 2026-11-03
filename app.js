@@ -13,6 +13,8 @@ const DEFAULT_STATE = {
     startDate: null,         // first day tracking started (YYYY-MM-DD)
     fixed: [],               // fixed monthly costs: { id, name, amount }
     myName: '',              // your name as banks show it; payments to it are transfers between your own accounts
+    accounts: [],            // savings accounts: { id, name, balance, asOf }
+    investments: [],         // { id, type, name, invested, current?, date, rate?, maturity?, note? }
   },
   txns: [],                  // { id, date: 'YYYY-MM-DD', time, name, category, method, amount }
   lastSummary: null,         // date key of the last night-summary sent
@@ -169,10 +171,13 @@ const fixedTotal = () => (state.settings.fixed || []).reduce((s, f) => s + Numbe
 const spendable = () => Math.max(0, state.settings.income - fixedTotal());
 const baseDaily = (k) => spendable() / daysInMonth(k);
 
-// "Fixed" spends were already set aside, and a "Card bill" only pays off card spends already logged,
-// so neither eats the daily budget.
-const NOT_COUNTED = ['Fixed', 'Card bill'];
-const counts = (t) => !NOT_COUNTED.includes(t.category);
+// The list also holds big one-off spends (kind 'big': card bills, a laptop…) and money received
+// (kind 'credit'). Neither touches the daily budget; daily spends have no kind.
+const isDaily = (t) => !t.kind;
+const daily = () => state.txns.filter(isDaily);
+
+// "Fixed" spends (rent, SIP…) were already set aside, so they don't eat the daily budget either.
+const counts = (t) => isDaily(t) && t.category !== 'Fixed';
 
 const spentOn = (k) => state.txns.filter((t) => t.date === k && counts(t)).reduce((s, t) => s + t.amount, 0);
 
@@ -220,6 +225,10 @@ const ICONS = {
   dot: '<circle cx="12" cy="12" r="4"/>',
   home: '<path d="M4 11 12 4l8 7"/><path d="M6 10v10h12V10"/><path d="M10 20v-5h4v5"/>',
   card: '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M3 10h18M7 15h3"/>',
+  in: '<path d="M12 4v11M7 10l5 5 5-5"/><path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2"/>',
+  out: '<path d="M12 15V4M7 9l5-5 5 5"/><path d="M4 17v2a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-2"/>',
+  bank: '<path d="M3 10 12 4l9 6"/><path d="M5 10v8M9.5 10v8M14.5 10v8M19 10v8M3 20h18"/>',
+  growth: '<path d="M4 18 10 12l4 4 6-8"/><path d="M15 8h5v5"/>',
 };
 
 const CATEGORIES = {
@@ -232,14 +241,22 @@ const CATEGORIES = {
   'Entertainment': 'film',
   'Health':        'heart',
   'Fixed':         'home', // rent, SIP, EMI: set aside up front, not counted against the day
-  'Card bill':     'card', // paying off the credit card: its purchases were already counted
   'Other':         'dot',
 };
 
-const icon = (cat, name = '') => {
-  const key = /zepto|swiggy instamart/i.test(name) ? 'scooter' : CATEGORIES[cat] || 'dot';
-  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[key]}</svg>`;
+// Big one-off spends: kept out of the daily budget. A card bill only pays off purchases already logged.
+const BIG_CATEGORIES = ['Card bill', 'Gadgets', 'Travel', 'Home', 'Medical', 'Education', 'Gifts', 'Other'];
+const CREDIT_SOURCES = ['Salary', 'Bonus', 'Refund', 'Interest', 'Transfer in', 'Gift', 'Other'];
+const INVEST_TYPES = ['Stocks', 'Mutual fund', 'FD', 'Bonds', 'PF', 'NPS', 'Gold', 'Crypto', 'Real estate', 'Other'];
+const DATED_TYPES = ['FD', 'Bonds', 'PF', 'NPS']; // ask for an interest rate and maturity date
+
+const icon = (cat, name = '', kind = '') => {
+  const key = kind === 'credit' ? 'in' : cat === 'Card bill' ? 'card' : kind === 'big' ? 'out'
+    : /zepto|swiggy instamart/i.test(name) ? 'scooter' : CATEGORIES[cat] || 'dot';
+  return svgIcon(key);
 };
+const svgIcon = (key) =>
+  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICONS[key]}</svg>`;
 
 // Merchant keyword → category, used for quick-add and SMS auto-detection.
 const MERCHANTS = [
@@ -266,7 +283,7 @@ const isFixedName = (name, fixed = state.settings.fixed || []) => {
 const CARD_BILL = /credit ?card (bill|payment|dues)|card ?bill|\bcc (bill|payment)|\bcred\b|towards (your )?([a-z]+ )*credit card/i;
 
 const guessCategory = (name) =>
-  isFixedName(name) ? 'Fixed' : CARD_BILL.test(name) ? 'Card bill' : (MERCHANTS.find(([re]) => re.test(name)) || [, 'Other'])[1];
+  isFixedName(name) ? 'Fixed' : (MERCHANTS.find(([re]) => re.test(name)) || [, 'Other'])[1];
 
 const QUICK_ADD = [
   { name: 'Coffee', category: 'Food & drink', amount: 250 },
@@ -310,9 +327,11 @@ function parseSms(text) {
   const method = /card/i.test(text) ? 'Card' : /atm|withdrawn/i.test(text) ? 'Cash' : 'UPI';
   // The UPI reference is the same in the SMS and the email for one payment, so it catches cross-channel duplicates.
   const ref = text.match(/(?:\bref(?:erence)?(?:\s*no)?\.?|\brrn|\bupi(?:\/p2[am])?)[\s:\/#.-]*(\d{12})\b/i)?.[1];
-  const category = CARD_BILL.test(text) ? 'Card bill' : guessCategory(name);
-  if (category === 'Card bill' && /credit|card|upi payment/i.test(name)) name = 'Credit card bill'; // not "Your Hdfc Bank Credit"
-  return { name: titleCase(name), amount, method, category, date: dateInText(text), ...(ref ? { ref } : {}) };
+  // Paying a credit card is a big spend, not a daily one: its purchases were already counted.
+  const bill = CARD_BILL.test(text);
+  if (bill && /credit|card|upi payment/i.test(name)) name = 'Credit card bill'; // not "Your Hdfc Bank Credit"
+  const category = bill ? 'Card bill' : guessCategory(name);
+  return { name: titleCase(name), amount, method, category, date: dateInText(text), ...(bill ? { kind: 'big' } : {}), ...(ref ? { ref } : {}) };
 }
 
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
@@ -388,12 +407,12 @@ const titleCase = (s) => s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()
 
 /* ================= Mutations ================= */
 
-function addTxn({ name, category, amount, method = 'UPI', date = todayKey(), note = '', ref }) {
+function addTxn({ name, category, amount, method = 'UPI', date = todayKey(), note = '', ref, kind = '' }) {
   amount = Number(amount);
   if (!name || !(amount > 0)) return false;
   const ops = [];
   // Backfilled spends from before setup still count towards this month.
-  if (state.settings.startDate && date < state.settings.startDate) {
+  if (!kind && state.settings.startDate && date < state.settings.startDate) {
     state.settings.startDate = date;
     ops.push({ type: 'settings', settings: { startDate: date } });
   }
@@ -403,9 +422,10 @@ function addTxn({ name, category, amount, method = 'UPI', date = todayKey(), not
     date,
     time: `${pad(now.getHours())}:${pad(now.getMinutes())}`,
     name: name.trim(),
-    category: category || guessCategory(name),
-    method,
+    category: category || (kind ? 'Other' : guessCategory(name)),
+    method: kind === 'credit' ? '' : method,
     amount,
+    ...(kind ? { kind } : {}),
     ...(note.trim() ? { note: note.trim() } : {}),
     ...(ref ? { ref } : {}),
   };
@@ -423,17 +443,19 @@ function updateTxn(id, data) {
   const t = state.txns.find((x) => x.id === id);
   const amount = Number(data.amount);
   if (!t || !data.name?.trim() || !(amount > 0)) return false;
+  const kind = data.kind || ''; // '' (not left out) so the server forgets an old kind too
   const changes = {
     amount,
     name: data.name.trim(),
     category: data.category,
-    method: data.method,
+    method: kind === 'credit' ? '' : data.method,
     date: data.date || t.date,
     note: (data.note || '').trim(),
+    kind,
   };
   Object.assign(t, changes);
   const ops = [];
-  if (state.settings.startDate && changes.date < state.settings.startDate) {
+  if (!kind && state.settings.startDate && changes.date < state.settings.startDate) {
     state.settings.startDate = changes.date;
     ops.push({ type: 'settings', settings: { startDate: changes.date } });
   }
@@ -450,23 +472,25 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&
 let tab = 'today';
 
 function render() {
-  document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-  $('#fab').style.display = tab === 'settings' ? 'none' : '';
+  document.querySelectorAll('[data-tab]').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  // Money and Invest have their own add buttons.
+  $('#fab').style.display = ['settings', 'money', 'invest'].includes(tab) ? 'none' : '';
   if (needKey) return renderKeyPrompt();
   if (!state.settings.income) return renderOnboarding();
-  ({ today: renderToday, month: renderMonth, insights: renderInsights, settings: renderSettings })[tab]();
+  ({ today: renderToday, month: renderMonth, money: renderMoney, invest: renderInvest, insights: renderInsights, settings: renderSettings })[tab]();
 }
 
-function txnHtml(t) {
+function txnHtml(t, { withDate } = {}) {
+  const bits = [t.category + (t.category === 'Fixed' ? ' (set aside)' : ''), t.method, withDate && shortDate(t.date)].filter(Boolean);
   return `
     <div class="txn editable" data-edit="${t.id}" role="button" tabindex="0" aria-label="Edit ${esc(t.name)}">
-      <div class="ico">${icon(t.category, t.name)}</div>
+      <div class="ico">${icon(t.category, t.name, t.kind)}</div>
       <div class="meta">
         <div class="name">${esc(t.name)}</div>
-        <div class="cat">${esc(t.category)}${t.category === 'Fixed' ? ' (set aside)' : t.category === 'Card bill' ? ' (not counted)' : ''} · ${esc(t.method)}</div>
+        <div class="cat">${esc(bits.join(' · '))}</div>
         ${t.note ? `<div class="note">${esc(t.note)}</div>` : ''}
       </div>
-      <div class="amt">−${inr(t.amount)}</div>
+      <div class="amt${t.kind === 'credit' ? ' in' : ''}">${t.kind === 'credit' ? '+' : '−'}${inr(t.amount)}</div>
       <button class="del" data-del="${t.id}" aria-label="Delete">×</button>
     </div>`;
 }
@@ -479,7 +503,7 @@ function renderToday() {
   const color = stateColor(remaining, budget);
   const pct = budget > 0 ? Math.max(0, Math.min(100, (remaining / budget) * 100)) : 0;
   const day = parseKey(k).getDate();
-  const txns = state.txns.filter((t) => t.date === k).reverse();
+  const txns = daily().filter((t) => t.date === k).reverse();
   const tomorrow = previewTomorrow(k);
 
   view.innerHTML = `
@@ -644,7 +668,7 @@ function trendSeries(mode) {
   }
   // Drop periods from before tracking started, and treat the one tracking started in as
   // incomplete (like the current one), so missing history doesn't fake a trend.
-  const first = [state.settings.startDate, ...state.txns.map((t) => t.date)].filter(Boolean).sort()[0];
+  const first = [state.settings.startDate, ...daily().map((t) => t.date)].filter(Boolean).sort()[0];
   if (!first) return out.slice(-1);
   return out.filter((p) => p.to >= first).map((p) => (p.from < first ? { ...p, partial: true } : p));
 }
@@ -812,8 +836,7 @@ view.addEventListener('pointerout', (e) => { const w = e.target.closest?.('.char
 function renderInsights() {
   const k = todayKey();
   const from = insightRange === 'week' ? addDays(k, -6) : insightRange === 'month' ? monthStart(k) : '0000-00-00';
-  // A card bill would count its purchases a second time.
-  const txns = state.txns.filter((t) => t.date >= from && t.date <= k && t.category !== 'Card bill');
+  const txns = daily().filter((t) => t.date >= from && t.date <= k);
   const total = txns.reduce((s, t) => s + t.amount, 0);
 
   const byCat = {};
@@ -872,7 +895,7 @@ function renderInsights() {
 /** Explicit "Subscriptions" category, or the same merchant charging a similar amount in 2+ months. */
 function detectSubscriptions() {
   const groups = {};
-  for (const t of state.txns) {
+  for (const t of daily()) {
     const key = t.name.toLowerCase();
     (groups[key] = groups[key] || []).push(t);
   }
@@ -883,7 +906,7 @@ function detectSubscriptions() {
       out.push({ name: latest.name, amount: latest.amount, reason: '' });
       continue;
     }
-    if (['Bills', ...NOT_COUNTED].includes(latest.category)) continue; // rent, EMIs etc. recur but aren't subscriptions
+    if (latest.category === 'Bills' || latest.category === 'Fixed') continue; // rent, EMIs etc. recur but aren't subscriptions
     const months = new Set(list.map((t) => t.date.slice(0, 7)));
     const amounts = list.map((t) => t.amount);
     const similar = Math.max(...amounts) <= Math.min(...amounts) * 1.1;
@@ -951,6 +974,238 @@ function saveFixed(id, data, remove) {
   }
   state.settings.fixed = fixed;
   save({ type: 'settings', settings: { fixed } });
+  return true;
+}
+
+/* ---------- Money: savings accounts, money received, big spends ---------- */
+
+const sumOf = (list, f = (x) => x.amount) => list.reduce((s, x) => s + Number(f(x) || 0), 0);
+const newestFirst = (a, b) => b.date.localeCompare(a.date) || (b.time || '').localeCompare(a.time || '');
+const investValue = (i) => Number(i.current || i.invested || 0);
+
+function renderMoney() {
+  const k = todayKey();
+  const ms = monthStart(k);
+  const accounts = state.settings.accounts || [];
+  const savings = sumOf(accounts, (a) => a.balance);
+  const invested = sumOf(state.settings.investments || [], investValue);
+  const credits = state.txns.filter((t) => t.kind === 'credit').sort(newestFirst);
+  const bigs = state.txns.filter((t) => t.kind === 'big').sort(newestFirst);
+  const thisMonth = (t) => t.date >= ms && t.date <= k;
+  const inM = sumOf(credits.filter(thisMonth));
+  const bigM = sumOf(bigs.filter(thisMonth));
+  const dailyM = sumOf(daily().filter(thisMonth));
+  const net = inM - bigM - dailyM;
+  const monthName = parseKey(k).toLocaleString('en-IN', { month: 'long' });
+  const list = (items, empty) => items.length
+    ? `<div class="txn-list">${items.map((t) => txnHtml(t, { withDate: true })).join('')}</div>`
+    : `<div class="empty" style="padding:12px 0">${empty}</div>`;
+
+  view.innerHTML = `
+    <section class="card">
+      <div class="label">Savings + investments</div>
+      <div class="big" style="--state:var(--text);text-shadow:none">${inr(savings + invested)}</div>
+      <div class="sub">${inr(savings)} in savings · ${inr(invested)} invested</div>
+    </section>
+
+    <div class="label section-title">Savings accounts</div>
+    <section class="card">
+      <div class="txn-list" style="margin-bottom:12px">
+        ${accounts.map((a) => `
+          <div class="txn editable" data-account="${a.id}" role="button" tabindex="0" aria-label="Update ${esc(a.name)}">
+            <div class="ico">${svgIcon('bank')}</div>
+            <div class="meta"><div class="name">${esc(a.name)}</div><div class="cat">updated ${shortDate(a.asOf)}</div></div>
+            <div class="amt plain">${inr(a.balance)}</div>
+          </div>`).join('') || '<div class="empty" style="padding:8px 0">Add each bank account and its balance, then update it whenever you check your bank app.</div>'}
+      </div>
+      <button class="btn ghost" data-action="add-account">+ Add an account</button>
+    </section>
+
+    <div class="label section-title">${monthName} so far</div>
+    <section class="card">
+      <div class="fixed-maths" style="margin:0;border:0;padding:0">
+        <div><span>Money received</span><span class="in">+ ${inr(inM)}</span></div>
+        <div><span>Daily spends</span><span>− ${inr(dailyM)}</span></div>
+        <div><span>Big spends</span><span>− ${inr(bigM)}</span></div>
+        ${inM ? `<div class="total"><span>${net >= 0 ? 'Saved' : 'Spent more than came in'}</span><span class="${net >= 0 ? 'green' : 'red'}">${net < 0 ? '−' : ''}${inr(Math.abs(net))}</span></div>`
+          : `<div class="total"><span>Total spent</span><span>${inr(dailyM + bigM)}</span></div>`}
+      </div>
+    </section>
+
+    <div class="row add-pair">
+      <button class="btn" data-action="add-credit">+ Money in</button>
+      <button class="btn ghost" data-action="add-big">+ Big spend</button>
+    </div>
+
+    <div class="label section-title">Money received</div>
+    ${list(credits, 'Salary, bonus, refunds… add them with “+ Money in”.')}
+
+    <div class="label section-title">Big spends</div>
+    ${list(bigs, 'Card bills, a new phone, flights… they stay out of your daily budget.')}
+  `;
+}
+
+function openAccountSheet(a = {}) {
+  sheet.innerHTML = `
+    <form method="dialog" id="account-form" data-id="${a.id || ''}">
+      <h2>${a.id ? 'Update balance' : 'Add a savings account'}</h2>
+      <div class="field">
+        <label class="label" for="ac-name">Account</label>
+        <input id="ac-name" name="name" maxlength="40" placeholder="HDFC savings, Axis…" value="${esc(a.name ?? '')}" required />
+      </div>
+      <div class="field">
+        <label class="label" for="ac-balance">Balance now (₹)</label>
+        <input id="ac-balance" name="balance" type="number" inputmode="decimal" min="0" step="any" value="${a.balance ?? ''}" required />
+      </div>
+      <p class="hint">Just the number from your bank app. Nothing connects to your bank.</p>
+      <button class="btn" value="save">Save</button>
+      ${a.id ? '<button class="btn danger" value="delete" formnovalidate>Remove account</button>' : ''}
+      <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
+    </form>`;
+  showSheet();
+  $(a.id ? '#ac-balance' : '#ac-name', sheet).focus();
+}
+
+function accountFrom(data) {
+  const balance = Number(data.balance);
+  if (!data.name?.trim() || !(balance >= 0) || data.balance === '') return null;
+  return { name: data.name.trim(), balance, asOf: todayKey() };
+}
+
+/* ---------- Investments ---------- */
+
+function renderInvest() {
+  const inv = state.settings.investments || [];
+  const invested = sumOf(inv, (i) => i.invested);
+  const current = sumOf(inv, investValue);
+  const gain = current - invested;
+  const pct = invested ? (gain / invested) * 100 : 0;
+  const byType = {};
+  for (const i of inv) byType[i.type] = (byType[i.type] || 0) + investValue(i);
+  const types = Object.entries(byType).sort((a, b) => b[1] - a[1]);
+  const sorted = [...inv].sort((a, b) => INVEST_TYPES.indexOf(a.type) - INVEST_TYPES.indexOf(b.type) || investValue(b) - investValue(a));
+  const gainText = (g, base) => `${g >= 0 ? '+' : '−'}${inr(Math.abs(g))}${base ? ` (${g >= 0 ? '+' : '−'}${Math.abs((g / base) * 100).toFixed(1)}%)` : ''}`;
+
+  view.innerHTML = `
+    <section class="card">
+      <div class="label">Investments now worth</div>
+      <div class="big" style="--state:var(--text);text-shadow:none">${inr(current)}</div>
+      <div class="sub">${inv.length ? `Invested ${inr(invested)} · <span class="${gain >= 0 ? 'green' : 'red'}">${gainText(gain, invested)}</span>` : 'Stocks, mutual funds, FDs, bonds, PF… note them here to see everything in one place.'}</div>
+    </section>
+
+    ${types.length > 1 ? `
+      <section class="card">
+        <div class="label">By type</div>
+        ${types.map(([t, v]) => `
+          <div class="cat-row">
+            <div class="top"><span>${esc(t)}</span><span>${inr(v)} · ${Math.round((v / current) * 100)}%</span></div>
+            <div class="bar"><span style="width:${(v / types[0][1]) * 100}%"></span></div>
+          </div>`).join('')}
+      </section>` : ''}
+
+    <button class="btn" data-action="add-invest" style="margin-top:14px">+ Add an investment</button>
+
+    <div class="label section-title">Your investments</div>
+    <div class="txn-list">
+      ${sorted.map((i) => {
+        const g = investValue(i) - Number(i.invested || 0);
+        const bits = [i.type, i.rate && `${i.rate}%`, i.maturity ? `matures ${shortDate(i.maturity)}` : i.date && `since ${shortDate(i.date)}`].filter(Boolean);
+        return `
+          <div class="txn editable" data-invest="${i.id}" role="button" tabindex="0" aria-label="Edit ${esc(i.name)}">
+            <div class="ico">${svgIcon('growth')}</div>
+            <div class="meta">
+              <div class="name">${esc(i.name)}</div>
+              <div class="cat">${esc(bits.join(' · '))}</div>
+              ${i.note ? `<div class="note">${esc(i.note)}</div>` : ''}
+            </div>
+            <div class="amt plain">${inr(investValue(i))}${i.current && g ? `<small class="${g >= 0 ? 'green' : 'red'}">${gainText(g)}</small>` : ''}</div>
+          </div>`;
+      }).join('') || '<div class="empty">Nothing yet.</div>'}
+    </div>
+  `;
+}
+
+function openInvestSheet(i = {}) {
+  const type = i.type || 'Mutual fund';
+  sheet.innerHTML = `
+    <form method="dialog" id="invest-form" data-id="${i.id || ''}">
+      <h2>${i.id ? 'Edit investment' : 'Add an investment'}</h2>
+      <div class="row">
+        <div class="field">
+          <label class="label" for="i-type">Type</label>
+          <select id="i-type" name="type">${INVEST_TYPES.map((t) => `<option ${t === type ? 'selected' : ''}>${t}</option>`).join('')}</select>
+        </div>
+        <div class="field">
+          <label class="label" for="i-date">Started</label>
+          <input id="i-date" name="date" type="date" value="${i.date || todayKey()}" />
+        </div>
+      </div>
+      <div class="field">
+        <label class="label" for="i-name">Name</label>
+        <input id="i-name" name="name" maxlength="40" placeholder="Parag Parikh Flexi Cap, Infosys, SBI FD…" value="${esc(i.name ?? '')}" required />
+      </div>
+      <div class="row">
+        <div class="field">
+          <label class="label" for="i-invested">Invested (₹)</label>
+          <input id="i-invested" name="invested" type="number" inputmode="decimal" min="1" step="any" value="${i.invested ?? ''}" required />
+        </div>
+        <div class="field">
+          <label class="label" for="i-current">Worth now (₹)</label>
+          <input id="i-current" name="current" type="number" inputmode="decimal" min="0" step="any" placeholder="Same" value="${i.current ?? ''}" />
+        </div>
+      </div>
+      ${DATED_TYPES.includes(type) ? `
+      <div class="row">
+        <div class="field">
+          <label class="label" for="i-rate">Interest (% a year)</label>
+          <input id="i-rate" name="rate" type="number" inputmode="decimal" min="0" max="100" step="any" value="${i.rate ?? ''}" />
+        </div>
+        <div class="field">
+          <label class="label" for="i-maturity">Matures on</label>
+          <input id="i-maturity" name="maturity" type="date" value="${i.maturity || ''}" />
+        </div>
+      </div>` : ''}
+      <div class="field">
+        <label class="label" for="i-note">Note</label>
+        <textarea id="i-note" name="note" maxlength="200" rows="2" placeholder="Optional, e.g. ₹5,000 SIP on the 5th">${esc(i.note ?? '')}</textarea>
+      </div>
+      <p class="hint">Update “Worth now” whenever you check the app or statement, to see your gain.</p>
+      <button class="btn" value="save">Save</button>
+      ${i.id ? '<button class="btn danger" value="delete" formnovalidate>Remove investment</button>' : ''}
+      <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
+    </form>`;
+  // FDs, bonds, PF and NPS also ask for a rate and maturity date.
+  $('#i-type', sheet).addEventListener('change', (e) => {
+    openInvestSheet({ ...i, ...Object.fromEntries(new FormData($('form', sheet))), type: e.target.value });
+  });
+  showSheet();
+  if (!i.id && !i.name) $('#i-name', sheet).focus();
+}
+
+function investmentFrom(data) {
+  const invested = Number(data.invested);
+  if (!data.name?.trim() || !(invested > 0)) return null;
+  const opt = (v) => (v === '' || v == null ? undefined : Number(v));
+  return {
+    type: data.type, name: data.name.trim(), invested, date: data.date || todayKey(),
+    current: opt(data.current), rate: DATED_TYPES.includes(data.type) ? opt(data.rate) : undefined,
+    maturity: DATED_TYPES.includes(data.type) && data.maturity ? data.maturity : undefined,
+    note: (data.note || '').trim() || undefined,
+  };
+}
+
+/** Add, edit or remove one entry of a settings list (accounts, investments), synced like fixed costs. */
+function saveListItem(key, id, remove, build) {
+  let list = [...(state.settings[key] || [])];
+  if (remove) list = list.filter((x) => x.id !== id);
+  else {
+    const item = build();
+    if (!item) return false;
+    const full = JSON.parse(JSON.stringify({ id: id || String(Date.now()), ...item })); // drops undefined
+    list = id ? list.map((x) => (x.id === id ? full : x)) : [...list, full];
+  }
+  state.settings[key] = list;
+  save({ type: 'settings', settings: { [key]: list } });
   return true;
 }
 
@@ -1116,33 +1371,53 @@ const sheet = $('#sheet');
 
 const showSheet = () => sheet.open || sheet.showModal();
 
-/** Add form, or with `prefill.id` the edit form. `day` returns to that day's list afterwards. */
+const KINDS = {
+  '':     { tab: 'Daily spend', add: 'Add a spend',          edit: 'Edit spend',          what: 'Where', place: 'Coffee, Blinkit, Uber…',          cats: Object.keys(CATEGORIES), cat: 'Food & drink', noun: 'spend' },
+  big:    { tab: 'Big spend',   add: 'Add a big spend',      edit: 'Edit big spend',      what: 'What',  place: 'Credit card bill, laptop, flights…', cats: BIG_CATEGORIES,         cat: 'Card bill',    noun: 'big spend',
+            hint: "Kept out of your daily budget, so one large payment doesn't wreck the day." },
+  credit: { tab: 'Money in',    add: 'Add money received',   edit: 'Edit money received', what: 'From',  place: 'Salary, bonus, refund…',             cats: CREDIT_SOURCES,         cat: 'Salary',       noun: 'entry',
+            hint: "A record of what came in. Your daily budget still comes from your monthly income in Settings." },
+};
+
+/**
+ * Add form, or with `prefill.id` the edit form. `prefill.kind` picks daily spend, big spend or money in.
+ * `day` returns to that day's list afterwards.
+ */
 function openAddSheet(prefill = {}, { day } = {}) {
   const editing = !!prefill.id;
+  const kind = prefill.kind || '';
+  const K = KINDS[kind];
+  const cat = K.cats.includes(prefill.category) ? prefill.category : K.cat;
   sheet.innerHTML = `
     <form method="dialog" id="${editing ? 'edit-form' : 'add-form'}" data-id="${prefill.id || ''}" data-day="${day || ''}">
-      <h2>${editing ? 'Edit spend' : 'Add a spend'}</h2>
+      <h2>${editing ? K.edit : K.add}</h2>
+      <input type="hidden" name="kind" value="${kind}" />
+      <div class="segmented kind-switch" role="radiogroup" aria-label="Type">
+        ${Object.entries(KINDS).map(([k, v]) => `<button type="button" role="radio" aria-checked="${k === kind}" data-kind="${k}" class="${k === kind ? 'on' : ''}">${v.tab}</button>`).join('')}
+      </div>
+      ${K.hint ? `<p class="hint">${K.hint}</p>` : ''}
       <div class="field">
         <label class="label" for="a-amount">Amount (₹)</label>
         <input id="a-amount" name="amount" type="number" inputmode="decimal" min="1" step="any" value="${prefill.amount ?? ''}" required />
       </div>
       <div class="field">
-        <label class="label" for="a-name">Where</label>
-        <input id="a-name" name="name" maxlength="40" placeholder="Coffee, Blinkit, Uber…" value="${esc(prefill.name ?? '')}" required />
+        <label class="label" for="a-name">${K.what}</label>
+        <input id="a-name" name="name" maxlength="40" placeholder="${K.place}" value="${esc(prefill.name ?? '')}" required />
       </div>
       <div class="row">
         <div class="field">
-          <label class="label" for="a-cat">Category</label>
+          <label class="label" for="a-cat">${kind === 'credit' ? 'Type' : 'Category'}</label>
           <select id="a-cat" name="category">
-            ${Object.keys(CATEGORIES).map((c) => `<option ${c === (prefill.category || 'Food & drink') ? 'selected' : ''}>${c}</option>`).join('')}
+            ${K.cats.map((c) => `<option ${c === cat ? 'selected' : ''}>${c}</option>`).join('')}
           </select>
         </div>
+        ${kind === 'credit' ? '' : `
         <div class="field">
           <label class="label" for="a-method">Paid via</label>
           <select id="a-method" name="method">
             ${['UPI', 'Card', 'Cash', 'Net banking'].map((m) => `<option ${m === (prefill.method || 'UPI') ? 'selected' : ''}>${m}</option>`).join('')}
           </select>
-        </div>
+        </div>`}
       </div>
       <div class="field">
         <label class="label" for="a-date">Date</label>
@@ -1153,22 +1428,35 @@ function openAddSheet(prefill = {}, { day } = {}) {
         <textarea id="a-note" name="note" maxlength="200" rows="2" placeholder="Optional, e.g. groceries for the week">${esc(prefill.note ?? '')}</textarea>
       </div>
       <button class="btn" value="save">${editing ? 'Save' : 'Add'}</button>
-      ${editing ? '<button class="btn danger" value="delete" formnovalidate>Delete spend</button>' : ''}
+      ${editing ? `<button class="btn danger" value="delete" formnovalidate>Delete ${K.noun}</button>` : ''}
       <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
     </form>`;
+  const form = $('form', sheet);
   const name = $('#a-name', sheet);
-  const cat = $('#a-cat', sheet);
+  const select = $('#a-cat', sheet);
+  // Switching type redraws the form, keeping what was typed.
+  const switchTo = (k, extra = {}) => {
+    const data = Object.fromEntries(new FormData(form));
+    openAddSheet({ ...prefill, ...data, ...extra, kind: k }, { day });
+    const n = $('#a-name', sheet);
+    n.focus();
+    n.setSelectionRange(n.value.length, n.value.length);
+  };
+  form.querySelectorAll('[data-kind]').forEach((b) => b.addEventListener('click', () => switchTo(b.dataset.kind)));
   name.addEventListener('input', () => {
+    // "Credit card bill" typed as a daily spend: that belongs with the big spends.
+    if (!kind && CARD_BILL.test(name.value)) return switchTo('big', { category: 'Card bill' });
+    if (kind) return;
     const g = guessCategory(name.value);
-    if (g !== 'Other') cat.value = g;
+    if (g !== 'Other') select.value = g;
   });
   showSheet();
-  if (!editing) (prefill.amount ? name : $('#a-amount', sheet)).focus();
+  if (!editing && !prefill.name) (prefill.amount ? name : $('#a-amount', sheet)).focus();
 }
 
 /** Everything spent on one day, from a tap on the Month calendar. */
 function openDaySheet(k) {
-  const txns = state.txns.filter((t) => t.date === k).sort((a, b) => (b.time || '').localeCompare(a.time || ''));
+  const txns = daily().filter((t) => t.date === k).sort((a, b) => (b.time || '').localeCompare(a.time || ''));
   const spent = spentOn(k);
   const budget = budgetFor(k);
   const verdict = k === todayKey() ? 'so far today' : spent <= budget ? '· good day 💚' : '· over budget 😬';
@@ -1232,7 +1520,19 @@ sheet.addEventListener('close', () => {
 function handleSheet(form, value) {
   const data = Object.fromEntries(new FormData(form));
   if (form.id === 'add-form') {
-    if (addTxn(data)) { toast(`−${inr(data.amount)} · ${data.name}`); render(); }
+    if (addTxn(data)) {
+      const sign = data.kind === 'credit' ? '+' : '−';
+      toast(`${sign}${inr(Number(data.amount))} · ${data.name}${data.kind === 'big' ? ' · big spend, daily budget unchanged' : ''}`);
+      render();
+    }
+  } else if (form.id === 'account-form') {
+    const removed = value === 'delete';
+    if (saveListItem('accounts', form.dataset.id, removed, () => accountFrom(data))) toast(removed ? 'Account removed' : 'Balance saved');
+    render();
+  } else if (form.id === 'invest-form') {
+    const removed = value === 'delete';
+    if (saveListItem('investments', form.dataset.id, removed, () => investmentFrom(data))) toast(removed ? 'Investment removed' : 'Investment saved');
+    render();
   } else if (form.id === 'fixed-form') {
     const removed = value === 'delete';
     if (saveFixed(form.dataset.id, data, removed)) toast(removed ? 'Fixed cost removed' : `Saved · daily budget now ${inr(budgetFor(todayKey()))}`);
@@ -1329,8 +1629,9 @@ function toast(msg, ms = 2600) {
 }
 
 function exportCsv() {
-  const rows = [['date', 'time', 'name', 'category', 'method', 'amount']]
-    .concat(state.txns.map((t) => [t.date, t.time, t.name, t.category, t.method, t.amount]));
+  const kinds = { '': 'daily spend', big: 'big spend', credit: 'money in' };
+  const rows = [['date', 'time', 'type', 'name', 'category', 'method', 'amount']]
+    .concat(state.txns.map((t) => [t.date, t.time, kinds[t.kind || ''], t.name, t.category, t.method, t.kind === 'credit' ? t.amount : -t.amount]));
   const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
@@ -1372,8 +1673,8 @@ function loadDemo() {
 
 /* ================= Events ================= */
 
-document.querySelector('.tabs').addEventListener('click', (e) => {
-  const b = e.target.closest('[data-tab]');
+document.querySelector('.app').addEventListener('click', (e) => {
+  const b = e.target.closest('.tabs [data-tab], .topbar [data-tab]');
   if (!b) return;
   tab = b.dataset.tab;
   render();
@@ -1388,6 +1689,10 @@ view.addEventListener('click', async (e) => {
   if (row && !t) return openAddSheet(state.txns.find((x) => x.id === row.dataset.edit));
   const fixedRow = e.target.closest('[data-fixed]');
   if (fixedRow) return openFixedSheet((state.settings.fixed || []).find((f) => f.id === fixedRow.dataset.fixed));
+  const acct = e.target.closest('[data-account]');
+  if (acct) return openAccountSheet((state.settings.accounts || []).find((a) => a.id === acct.dataset.account));
+  const inv = e.target.closest('[data-invest]');
+  if (inv) return openInvestSheet((state.settings.investments || []).find((i) => i.id === inv.dataset.invest));
   const cell = e.target.closest('[data-day]');
   if (cell) return openDaySheet(cell.dataset.day);
   if (!t) return;
@@ -1408,6 +1713,10 @@ view.addEventListener('click', async (e) => {
   } else if (t.dataset.action === 'sms') openSmsSheet();
   else if (t.dataset.action === 'export') exportCsv();
   else if (t.dataset.action === 'add-fixed') openFixedSheet();
+  else if (t.dataset.action === 'add-account') openAccountSheet();
+  else if (t.dataset.action === 'add-invest') openInvestSheet();
+  else if (t.dataset.action === 'add-credit') openAddSheet({ kind: 'credit' });
+  else if (t.dataset.action === 'add-big') openAddSheet({ kind: 'big' });
   else if (t.dataset.action === 'copy-link' || t.dataset.action === 'copy') {
     const input = $('#' + (t.dataset.copy || 'sms-link'));
     try { await navigator.clipboard.writeText(input.value); toast('Copied'); } catch {

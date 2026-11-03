@@ -51,7 +51,7 @@ STATIC = {'/', '/index.html', '/styles.css', '/app.js', '/sw.js', '/manifest.web
           '/icon.svg', '/apple-touch-icon.png', '/icon-192.png', '/icon-512.png'}
 
 DEFAULT_SETTINGS = {'income': 0, 'rollover': True, 'reminderTime': '21:00', 'notify': False, 'startDate': None,
-                    'fixed': [], 'myName': ''}
+                    'fixed': [], 'myName': '', 'accounts': [], 'investments': []}
 
 
 # ================= Storage =================
@@ -116,18 +116,18 @@ def inr(n):
 
 # ================= Budget engine (mirrors app.js) =================
 
-# "Fixed" spends (rent, SIP…) were set aside up front, and a "Card bill" only pays off card spends
-# already logged, so neither eats the daily budget.
-NOT_COUNTED = ('Fixed', 'Card bill')
+# Only daily spends eat the daily budget: not big one-off spends or money received (both have a
+# 'kind'), and not "Fixed" spends (rent, SIP…), which were set aside up front.
+def counts(t):
+    return not t.get('kind') and t.get('category') != 'Fixed'
 
 
 def spent_on(s, k):
-    return sum(t['amount'] for t in s['txns'] if t['date'] == k and t.get('category') not in NOT_COUNTED)
+    return sum(t['amount'] for t in s['txns'] if t['date'] == k and counts(t))
 
 
 def spent_between(s, start, end_exclusive):
-    return sum(t['amount'] for t in s['txns']
-               if start <= t['date'] < end_exclusive and t.get('category') not in NOT_COUNTED)
+    return sum(t['amount'] for t in s['txns'] if start <= t['date'] < end_exclusive and counts(t))
 
 
 def fixed_total(s):
@@ -224,8 +224,6 @@ def is_self(name, mine):
 def guess_category(name, fixed=()):
     if is_fixed_name(name, fixed):
         return 'Fixed'
-    if CARD_BILL.search(name):
-        return 'Card bill'
     return next((c for pat, c in MERCHANTS if re.search(pat, name, re.I)), 'Other')
 
 
@@ -279,11 +277,14 @@ def parse_sms(text, fixed=()):
     name = re.sub(r'\s+', ' ', re.sub(r'[._\-]+', ' ', name)).strip() or 'UPI payment'
     name = name[:22]
     method = 'Card' if re.search('card', text, re.I) else 'Cash' if re.search('atm|withdrawn', text, re.I) else 'UPI'
-    category = 'Card bill' if CARD_BILL.search(text) else guess_category(name, fixed)
-    if category == 'Card bill' and re.search(r'credit|card|upi payment', name, re.I):
+    # Paying a credit card is a big spend, not a daily one: its purchases were already counted.
+    bill = CARD_BILL.search(text)
+    if bill and re.search(r'credit|card|upi payment', name, re.I):
         name = 'Credit card bill'  # not "Your Hdfc Bank Credit"
+    category = 'Card bill' if bill else guess_category(name, fixed)
     ref = REF.search(text)
     return {
+        **({'kind': 'big'} if bill else {}),
         **({'ref': ref[1]} if ref else {}),
         'name': title_case(name),
         'amount': int(amount) if amount.is_integer() else amount,
@@ -327,6 +328,7 @@ def add_from_sms(text):
             return f"Not counted: {inr(p['amount'])} transfer to your own account."
         s['txns'].append({
             **({'ref': p['ref']} if p.get('ref') else {}),
+            **({'kind': p['kind']} if p.get('kind') else {}),
             'id': str(uuid.uuid4()),
             'date': p['date'],
             'time': now().strftime('%H:%M'),
@@ -336,7 +338,7 @@ def add_from_sms(text):
             'amount': p['amount'],
         })
         st = s['settings']
-        if st.get('startDate') and p['date'] < st['startDate']:
+        if not p.get('kind') and st.get('startDate') and p['date'] < st['startDate']:
             st['startDate'] = p['date']
         s['seenSms'] = (s['seenSms'] + [fp])[-500:]
         store(s)
@@ -348,8 +350,8 @@ def add_from_sms(text):
             line += f" ({d.day} {d.strftime('%b')})"
         if p['category'] == 'Fixed':
             return f'{line}\nFixed cost, already set aside. Daily budget unchanged.'
-        if p['category'] == 'Card bill':
-            return f'{line}\nCard bill, not counted: its purchases already were. Daily budget unchanged.'
+        if p.get('kind') == 'big':
+            return f'{line}\nCard bill, saved under Big spends. Daily budget unchanged.'
         left = budget_for(s, k) - spent_on(s, k)
         status = f'{inr(left)} left today' if left >= 0 else f"{inr(-left)} over today's budget"
         return f'{line}\n{status}'
