@@ -494,12 +494,13 @@ function renderToday() {
       </div>
     </section>
 
+    <button class="btn paste-cta" data-action="sms">📩 Paste SMS</button>
+
     ${nightSummaryCard(k)}
 
     <div class="label section-title">Quick add</div>
     <div class="quick">
       ${QUICK_ADD.map((q, i) => `<button class="chip" data-quick="${i}">${q.name} <b>${inr(q.amount)}</b></button>`).join('')}
-      <button class="chip" data-action="sms">📩 Paste SMS</button>
     </div>
 
     <div class="label section-title">Today's transactions</div>
@@ -1200,6 +1201,12 @@ function openSmsSheet() {
       <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
     </form>`;
   showSheet();
+  const box = sheet.querySelector('textarea');
+  box.focus();
+  // On the https (hosted) app, fill in a copied bank alert straight away.
+  navigator.clipboard?.readText?.().then((t) => {
+    if (!box.value && parseSms(t)) box.value = t;
+  }).catch(() => {});
 }
 
 sheet.addEventListener('close', () => {

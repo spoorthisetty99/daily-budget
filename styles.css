@@ -286,6 +286,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .btn.ghost { background: var(--card-2); color: var(--text); border: 1px solid var(--line); }
 .btn.danger { background: transparent; color: var(--red); border: 1px solid color-mix(in srgb, var(--red) 40%, transparent); }
 .btn + .btn { margin-top: 10px; }
+.paste-cta { margin-top: 12px; }
 
 .segmented { display: flex; background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 4px; margin-bottom: 16px; }
 .segmented button { flex: 1; border: 0; background: none; padding: 8px; border-radius: 9px; font-weight: 600; font-size: 14px; color: var(--muted); }
