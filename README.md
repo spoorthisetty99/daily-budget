@@ -48,7 +48,7 @@ Why PythonAnywhere and not Render's free plan: Render's free servers go to sleep
 alert after a quiet spell can time out) and wipe their files on every restart (your `data.json` would vanish).
 PythonAnywhere's free plan stays on, keeps files, and gives you HTTPS (needed to install on Android).
 
-1. Sign up at **pythonanywhere.com** (free "Beginner" plan). Your app will live at `https://<username>.pythonanywhere.com`.
+1. Sign up at **pythonanywhere.com** (free "Beginner" plan, near the bottom of the pricing page). Your app will live at `https://<username>.pythonanywhere.com`.
 2. **Consoles → Bash**, then:
    ```bash
    git clone https://github.com/spoorthisetty99/daily-budget.git
@@ -77,7 +77,8 @@ PythonAnywhere's free plan stays on, keeps files, and gives you HTTPS (needed to
    header `X-Budget-Key: <that person's app key>`. Settings in the app shows both, with copy buttons.
 
 Updating later: in a Bash console, `cd daily-budget && git pull`, then **Reload** on the Web tab.
-Free plan housekeeping: every 3 months, press **"Run until 3 months from today"** on the Web tab.
+Free plan housekeeping: once a month, log in and press **"Run until 1 month from today"** on the Web tab (PythonAnywhere
+emails a week before the site would pause; your data is kept either way).
 
 ## Logins
 
