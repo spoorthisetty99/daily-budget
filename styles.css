@@ -308,6 +308,7 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .sheet::backdrop { background: rgb(0 0 0 / .6); backdrop-filter: blur(3px); }
 .sheet h2 { margin: 0 0 16px; font-size: 20px; font-weight: 900; }
 .sheet .hint { font-size: 12px; color: var(--muted); margin: -6px 0 14px; }
+.field .hint { display: block; font-size: 12px; color: var(--muted); margin-top: 6px; }
 
 /* ---- FAB / tabs / toast ---- */
 .fab {

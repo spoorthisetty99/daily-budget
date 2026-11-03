@@ -51,7 +51,7 @@ STATIC = {'/', '/index.html', '/styles.css', '/app.js', '/sw.js', '/manifest.web
           '/icon.svg', '/apple-touch-icon.png', '/icon-192.png', '/icon-512.png'}
 
 DEFAULT_SETTINGS = {'income': 0, 'rollover': True, 'reminderTime': '21:00', 'notify': False, 'startDate': None,
-                    'fixed': []}
+                    'fixed': [], 'myName': ''}
 
 
 # ================= Storage =================
@@ -207,6 +207,14 @@ def is_fixed_name(name, fixed):
     return False
 
 
+def is_self(name, mine):
+    """A payee matching your own name (or a two-word start of it, as banks cut names short)."""
+    def norm(x):
+        return re.sub(r'[^a-z]+', ' ', str(x or '').lower()).strip()
+    short, long = sorted([norm(name), norm(mine)], key=len)
+    return len(short) >= 6 and (short == long or (' ' in short and long.startswith(short)))
+
+
 def guess_category(name, fixed=()):
     if is_fixed_name(name, fixed):
         return 'Fixed'
@@ -302,6 +310,10 @@ def add_from_sms(text):
         same = p.get('ref') and next((x for x in s['txns'] if x.get('ref') == p['ref']), None)
         if same:
             return f"Already added: {same['name']} {inr(same['amount'])} (same payment's SMS or email)."
+        if is_self(p['name'], s['settings'].get('myName')):
+            s['seenSms'] = (s['seenSms'] + [fp])[-500:]
+            store(s)
+            return f"Not counted: {inr(p['amount'])} transfer to your own account."
         s['txns'].append({
             **({'ref': p['ref']} if p.get('ref') else {}),
             'id': str(uuid.uuid4()),

@@ -12,6 +12,7 @@ const DEFAULT_STATE = {
     notify: false,
     startDate: null,         // first day tracking started (YYYY-MM-DD)
     fixed: [],               // fixed monthly costs: { id, name, amount }
+    myName: '',              // your name as banks show it; payments to it are transfers between your own accounts
   },
   txns: [],                  // { id, date: 'YYYY-MM-DD', time, name, category, method, amount }
   lastSummary: null,         // date key of the last night-summary sent
@@ -352,10 +353,26 @@ function importMessage(text) {
   if (!p) return null;
   const same = p.ref && state.txns.find((t) => t.ref === p.ref);
   if (same) return { dup: same };
+  if (isSelf(p.name)) {
+    state.seenSms = [...state.seenSms, fp].slice(-500);
+    save({ type: 'seen', fp });
+    return { self: p };
+  }
   addTxn(p);
   state.seenSms = [...state.seenSms, fp].slice(-500);
   save({ type: 'seen', fp });
   return p;
+}
+
+/**
+ * A payee matching your own name is money moved between your accounts, not a spend.
+ * Banks cut names short ("PRIYA SHARMA"), so a two-word start of your name counts too.
+ */
+function isSelf(name, mine = state.settings.myName) {
+  const norm = (x) => String(x || '').toLowerCase().replace(/[^a-z]+/g, ' ').trim();
+  const a = norm(name), b = norm(mine);
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  return short.length >= 6 && (short === long || (short.includes(' ') && long.startsWith(short)));
 }
 
 const titleCase = (s) => s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
@@ -948,6 +965,11 @@ function renderSettings() {
           <label class="label" for="reminderTime">Summary time</label>
           <input id="reminderTime" name="reminderTime" type="time" value="${s.reminderTime}" />
         </div>
+        <div class="field">
+          <label class="label" for="myName">Your name, as banks show it</label>
+          <input id="myName" name="myName" type="text" autocomplete="name" placeholder="e.g. Priya Sharma" value="${esc(s.myName || '')}" />
+          <small class="hint">Money you send to yourself (e.g. Axis → HDFC) isn't counted as spending.</small>
+        </div>
         <button class="btn" type="submit">Save</button>
       </form>
     </section>
@@ -1204,14 +1226,16 @@ function handleSheet(form, value) {
     render();
   } else if (form.id === 'sms-form') {
     const results = splitMessages(data.sms).map(importMessage);
-    const added = results.filter((r) => r && !r.dup);
+    const added = results.filter((r) => r && !r.dup && !r.self);
     const dups = results.filter((r) => r?.dup).map((r) => r.dup);
+    const selves = results.filter((r) => r?.self).map((r) => r.self);
     const parts = [];
     if (added.length) parts.push(`Added ${added.length} spend${added.length > 1 ? 's' : ''} · ${inr(added.reduce((s, p) => s + p.amount, 0))}`);
+    if (selves.length) parts.push(`Not counted, transfer to your own account: ${selves.map((p) => inr(p.amount)).join(', ')}`);
     // Name the duplicates, so a stale clipboard (the previous message pasted again) is easy to spot.
     if (dups.length) parts.push(`Already added: ${dups.map((p) => `${p.name} ${inr(p.amount)} (${shortDate(p.date)})`).join(', ')}`);
     if (!parts.length) parts.push("No debit found in that. Paste the whole message, including the “Sent Rs” / “debited” line.");
-    toast(parts.join(' · '), dups.length || !added.length ? 6000 : undefined);
+    toast(parts.join(' · '), dups.length || selves.length || !added.length ? 6000 : undefined);
     render();
   }
 }
@@ -1267,6 +1291,7 @@ function importFromHash() {
   if (!state.settings.income) return toast('Set your monthly income first, then the message will be counted next time.');
   const p = importMessage(text);
   if (p?.dup) return toast(`Already added: ${p.dup.name} ${inr(p.dup.amount)} (${shortDate(p.dup.date)})`);
+  if (p?.self) return toast(`Not counted: ${inr(p.self.amount)} transfer to your own account`);
   if (!p) return toast("No debit found in that message — nothing added");
   tab = 'today';
   render();
@@ -1417,10 +1442,11 @@ view.addEventListener('submit', async (e) => {
     s.rollover = !!data.rollover;
     s.reminderTime = data.reminderTime || '21:00';
     s.notify = !!data.notify;
+    s.myName = String(data.myName || '').trim();
     if (s.notify && 'Notification' in window && Notification.permission === 'default') {
       s.notify = (await Notification.requestPermission()) === 'granted';
     }
-    save({ type: 'settings', settings: { income: s.income, rollover: s.rollover, reminderTime: s.reminderTime, notify: s.notify } });
+    save({ type: 'settings', settings: { income: s.income, rollover: s.rollover, reminderTime: s.reminderTime, notify: s.notify, myName: s.myName } });
     toast('Saved');
     render();
   }
