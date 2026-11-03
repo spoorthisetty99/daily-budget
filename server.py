@@ -176,7 +176,13 @@ def summary_text():
 
 A = re.I | re.A
 DEBIT = re.compile(r'debited|paid|spent|sent|withdrawn|purchase|txn|payment of', re.I)
-CREDIT = re.compile(r'credited to your|received from|refund', re.I)
+CREDIT = re.compile(r'credited|received|deposited|refund', re.I)
+# The account's last digits: "A/C *3344", "A/c no. XX7788", "Account Number: XX7788", "account ending in 3344"
+ACCOUNT = re.compile(r"\b(?:a/c|acct|account)(?:\s*(?:no|number)\.?)?\s*:?\s*(?:ending\s+(?:with\s+|in\s+)?|[x*]+)(\d{3,6})\b", A)
+FROM = re.compile(r"\b(?:from|by)\s+(?:vpa\s+)?(?:(?:neft|imps|rtgs|upi)[-/ ]+)?([A-Za-z][\w&' .\-]{1,40}?)"
+                  r"(?=\s+(?:on|via|ref|upi|for|to|avl|a/c)\b|[.,(]|@|$)", A)
+CREDIT_SOURCES = [(r'salary|payroll|\bsal\b', 'Salary'), (r'refund|reversal|cashback', 'Refund'),
+                  (r'interest|\bint\.? ?pd', 'Interest'), (r'bonus', 'Bonus')]
 AMOUNT = re.compile(r'(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)', A)
 BALANCE_BEFORE = re.compile(r'(bal(ance)?|limit|avl\.?|available)\s*(is|:)?\s*$', A)
 VPA = re.compile(r'(?:vpa|upi id)\s*:?\s*([\w.\-]+)@[\w.]+', A)
@@ -256,11 +262,20 @@ def date_in_text(text):
     return t
 
 
+def direction(text):
+    """'out' for a debit, 'in' for a credit ("debited … credited to VPA x" is still a debit)."""
+    if re.search('debited', text, re.I):
+        return 'out'
+    if CREDIT.search(text):
+        return 'in'
+    return 'out' if DEBIT.search(text) else None
+
+
 def parse_sms(text, fixed=()):
     text = re.sub(r'\s+', ' ', str(text)).strip()
-    if not DEBIT.search(text):
-        return None
-    if CREDIT.search(text) and not re.search('debited', text, re.I):
+    way = direction(text)
+    # A card bill's "payment received" comes from the card, not from a savings account.
+    if not way or (way == 'in' and CARD_BILL.search(text)):
         return None
     amounts = [m for m in AMOUNT.finditer(text)
                if not BALANCE_BEFORE.search(text[max(0, m.start() - 20):m.start()])]
@@ -272,6 +287,20 @@ def parse_sms(text, fixed=()):
         return None
     if amount <= 0:
         return None
+    acct = ACCOUNT.search(text)
+    ref = REF.search(text)
+    base = {
+        **({'ref': ref[1]} if ref else {}),
+        **({'acct': acct[1]} if acct else {}),
+        'dir': way,
+        'amount': int(amount) if amount.is_integer() else amount,
+        'date': date_in_text(text),
+    }
+    if way == 'in':
+        hit = FROM.search(text) or UPI_NAME.search(text) or INFO.search(text) or VPA.search(text)
+        name = re.sub(r'\s+', ' ', re.sub(r'[._\-]+', ' ', hit[1] if hit else '')).strip()[:22] or 'Money received'
+        source = next((c for pat, c in CREDIT_SOURCES if re.search(pat, text, re.I)), 'Other')
+        return {'kind': 'credit', **base, 'name': title_case(name), 'method': '', 'category': source}
     hit = TO.search(text) or UPI_NAME.search(text) or INFO.search(text) or VPA.search(text)
     name = hit[1] if hit else ''
     name = re.sub(r'\s+', ' ', re.sub(r'[._\-]+', ' ', name)).strip() or 'UPI payment'
@@ -282,15 +311,12 @@ def parse_sms(text, fixed=()):
     if bill and re.search(r'credit|card|upi payment', name, re.I):
         name = 'Credit card bill'  # not "Your Hdfc Bank Credit"
     category = 'Card bill' if bill else guess_category(name, fixed)
-    ref = REF.search(text)
     return {
         **({'kind': 'big'} if bill else {}),
-        **({'ref': ref[1]} if ref else {}),
+        **base,
         'name': title_case(name),
-        'amount': int(amount) if amount.is_integer() else amount,
         'method': method,
         'category': category,
-        'date': date_in_text(text),
     }
 
 
@@ -307,6 +333,56 @@ def fingerprint(text):
 
 # ================= Actions =================
 
+def remember(s, key):
+    s['seenSms'] = (s['seenSms'] + [key])[-500:]
+
+
+def move_balance(s, p, fp):
+    """Moves the savings account whose last digits are in the alert, once per payment (its SMS and email
+    share a UPI ref). Alerts dated before the day you typed the balance are already in it."""
+    digits = p.get('acct')
+    acct = digits and next((a for a in s['settings'].get('accounts') or []
+                            if len(a.get('digits') or '') >= 3
+                            and (digits.endswith(a['digits']) or a['digits'].endswith(digits))), None)
+    key = f"bal:{p.get('ref') or fp}:{p['dir']}"
+    if not acct or p['date'] < (acct.get('asOf') or '') or key in s['seenSms']:
+        return None
+    moved = float(acct['balance']) + (p['amount'] if p['dir'] == 'in' else -p['amount'])
+    acct['balance'] = int(moved) if moved.is_integer() else round(moved, 2)
+    remember(s, key)
+    return acct
+
+
+def record_alert(s, p):
+    """Adds the spend or money received. Returns ('added' | 'dup' | 'transfer', txn)."""
+    same = p.get('ref') and next((x for x in s['txns'] if x.get('ref') == p['ref']), None)
+    if same:
+        # One UPI ref leaving one account and arriving in another: money moved between your own accounts.
+        if same.get('kind') == 'transfer' or (same.get('kind') == 'credit') != (p['dir'] == 'in'):
+            same.update(kind='transfer', category='Own account', method='')
+            return 'transfer', same
+        return 'dup', same
+    t = {
+        **({'ref': p['ref']} if p.get('ref') else {}),
+        'id': str(uuid.uuid4()),
+        'date': p['date'],
+        'time': now().strftime('%H:%M'),
+        'name': p['name'],
+        'category': p['category'],
+        'method': p['method'],
+        'amount': p['amount'],
+    }
+    st = s['settings']
+    if is_self(p['name'], st.get('myName')):
+        t.update(kind='transfer', category='Own account', method='')
+    elif p.get('kind'):
+        t['kind'] = p['kind']
+    s['txns'].append(t)
+    if not t.get('kind') and st.get('startDate') and p['date'] < st['startDate']:
+        st['startDate'] = p['date']
+    return ('transfer' if t.get('kind') == 'transfer' else 'added'), t
+
+
 def add_from_sms(text):
     """Save one bank alert; returns the notification text for the shortcut."""
     with LOCK:
@@ -318,43 +394,31 @@ def add_from_sms(text):
             return 'Already added this one.'
         p = parse_sms(text, s['settings'].get('fixed'))
         if not p:
-            return 'No debit found in that message, nothing added.'
-        same = p.get('ref') and next((x for x in s['txns'] if x.get('ref') == p['ref']), None)
-        if same:
-            return f"Already added: {same['name']} {inr(same['amount'])} (same payment's SMS or email)."
-        if is_self(p['name'], s['settings'].get('myName')):
-            s['seenSms'] = (s['seenSms'] + [fp])[-500:]
-            store(s)
-            return f"Not counted: {inr(p['amount'])} transfer to your own account."
-        s['txns'].append({
-            **({'ref': p['ref']} if p.get('ref') else {}),
-            **({'kind': p['kind']} if p.get('kind') else {}),
-            'id': str(uuid.uuid4()),
-            'date': p['date'],
-            'time': now().strftime('%H:%M'),
-            'name': p['name'],
-            'category': p['category'],
-            'method': p['method'],
-            'amount': p['amount'],
-        })
-        st = s['settings']
-        if not p.get('kind') and st.get('startDate') and p['date'] < st['startDate']:
-            st['startDate'] = p['date']
-        s['seenSms'] = (s['seenSms'] + [fp])[-500:]
+            return 'No debit or credit found in that message, nothing added.'
+        remember(s, fp)
+        acct = move_balance(s, p, fp)
+        what, t = record_alert(s, p)
         store(s)
 
+        bal = f"\n{acct['name']}: {inr(acct['balance'])}" if acct else ''
+        if what == 'dup':
+            return f"Already added: {t['name']} {inr(t['amount'])} (same payment's SMS or email).{bal}"
+        if what == 'transfer':
+            return f"Moved {inr(p['amount'])} between your own accounts. Not counted as spending.{bal}"
         k = today()
-        line = f"−{inr(p['amount'])} · {p['name']}"
+        line = f"{'+' if p['dir'] == 'in' else '−'}{inr(p['amount'])} · {p['name']}"
         if p['date'] != k:
             d = pkey(p['date'])
             line += f" ({d.day} {d.strftime('%b')})"
+        if p['dir'] == 'in':
+            return f'{line}\nSaved under Money received.{bal}'
         if p['category'] == 'Fixed':
-            return f'{line}\nFixed cost, already set aside. Daily budget unchanged.'
+            return f'{line}\nFixed cost, already set aside. Daily budget unchanged.{bal}'
         if p.get('kind') == 'big':
-            return f'{line}\nCard bill, saved under Big spends. Daily budget unchanged.'
+            return f'{line}\nCard bill, saved under Big spends. Daily budget unchanged.{bal}'
         left = budget_for(s, k) - spent_on(s, k)
         status = f'{inr(left)} left today' if left >= 0 else f"{inr(-left)} over today's budget"
-        return f'{line}\n{status}'
+        return f'{line}\n{status}{bal}'
 
 
 def apply_ops(ops):

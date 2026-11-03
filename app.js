@@ -304,35 +304,53 @@ const QUICK_ADD = [
  */
 function parseSms(text) {
   text = String(text).replace(/\s+/g, ' ').trim(); // emails arrive with line breaks
-  if (!/debited|paid|spent|sent|withdrawn|purchase|txn|payment of/i.test(text)) return null;
-  if (/credited to your|received from|refund/i.test(text) && !/debited/i.test(text)) return null;
+  // 'out' for a debit, 'in' for a credit ("debited … credited to VPA x" is still a debit).
+  const dir = /debited/i.test(text) ? 'out' : /credited|received|deposited|refund/i.test(text) ? 'in'
+    : /debited|paid|spent|sent|withdrawn|purchase|txn|payment of/i.test(text) ? 'out' : null;
+  // A card bill's "payment received" comes from the card, not from a savings account.
+  if (!dir || (dir === 'in' && CARD_BILL.test(text))) return null;
   // Skip "Avl Bal Rs 12,000" / "credit limit INR 50,000" — take the first amount that isn't a balance.
   const amounts = [...text.matchAll(/(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)/gi)]
     .filter((m) => !/(bal(ance)?|limit|avl\.?|available)\s*(is|:)?\s*$/i.test(text.slice(Math.max(0, m.index - 20), m.index)));
   if (!amounts.length) return null;
   const amount = parseFloat(amounts[0][1].replace(/,/g, ''));
   if (!(amount > 0)) return null;
+  // The UPI reference is the same in the SMS and the email for one payment, so it catches cross-channel duplicates.
+  const ref = text.match(/(?:\bref(?:erence)?(?:\s*no)?\.?|\brrn|\bupi(?:\/p2[am])?)[\s:\/#.-]*(\d{12})\b/i)?.[1];
+  // The account's last digits: "A/C *3344", "A/c no. XX7788", "Account Number: XX7788", "account ending in 3344"
+  const acct = text.match(/\b(?:a\/c|acct|account)(?:\s*(?:no|number)\.?)?\s*:?\s*(?:ending\s+(?:with\s+|in\s+)?|[x*]+)(\d{3,6})\b/i)?.[1];
+  const base = { ...(ref ? { ref } : {}), ...(acct ? { acct } : {}), dir, amount, date: dateInText(text) };
+  const tidy = (s) => s.replace(/[._\-]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 22);
+  if (dir === 'in') {
+    const from = text.match(/\b(?:from|by)\s+(?:vpa\s+)?(?:(?:neft|imps|rtgs|upi)[-\/ ]+)?([A-Za-z][\w&' .\-]{1,40}?)(?=\s+(?:on|via|ref|upi|for|to|avl|a\/c)\b|[.,(]|@|$)/i)
+      || text.match(UPI_NAME) || text.match(INFO) || text.match(VPA);
+    const name = tidy(from ? from[1] : '') || 'Money received';
+    const source = (CREDIT_KINDS.find(([re]) => re.test(text)) || [, 'Other'])[1];
+    return { kind: 'credit', ...base, name: titleCase(name), method: '', category: source };
+  }
   let name = '';
-  const vpa = text.match(/(?:vpa|upi id)\s*:?\s*([\w.\-]+)@[\w.]+/i);
+  const vpa = text.match(VPA);
   const to = text.match(/\b(?:to|at|towards)\s+(?:vpa\s+)?([A-Za-z][\w&' .\-]{1,40}?)(?=\s+(?:on|via|ref|upi|using|from|for|avl|a\/c|\.|$)|[.,(]|@)/i);
-  // Axis & co: "UPI/P2A/512345678901/PRIYA SHARMA"
-  const upi = text.match(/\bupi\/p2[am]\/\d+\/([A-Za-z][A-Za-z&' .]{1,40}?)(?=\s*\/|\s+not\b|\s+avl|[.,]|$)/i);
-  const info = text.match(/\binfo:?\s*(?:upi|pos|imps|neft|ach|ecom)?[-\/ ]*([A-Za-z][\w&' .]{1,30}?)(?=[.,]|\s+avl|\s+on\b|$)/i);
+  const upi = text.match(UPI_NAME);
+  const info = text.match(INFO);
   if (to) name = to[1];
   else if (upi) name = upi[1];
   else if (info) name = info[1];
   else if (vpa) name = vpa[1];
-  name = name.replace(/[._\-]+/g, ' ').replace(/\s+/g, ' ').trim() || 'UPI payment';
-  name = name.length > 22 ? name.slice(0, 22) : name;
+  name = tidy(name) || 'UPI payment';
   const method = /card/i.test(text) ? 'Card' : /atm|withdrawn/i.test(text) ? 'Cash' : 'UPI';
-  // The UPI reference is the same in the SMS and the email for one payment, so it catches cross-channel duplicates.
-  const ref = text.match(/(?:\bref(?:erence)?(?:\s*no)?\.?|\brrn|\bupi(?:\/p2[am])?)[\s:\/#.-]*(\d{12})\b/i)?.[1];
   // Paying a credit card is a big spend, not a daily one: its purchases were already counted.
   const bill = CARD_BILL.test(text);
   if (bill && /credit|card|upi payment/i.test(name)) name = 'Credit card bill'; // not "Your Hdfc Bank Credit"
   const category = bill ? 'Card bill' : guessCategory(name);
-  return { name: titleCase(name), amount, method, category, date: dateInText(text), ...(bill ? { kind: 'big' } : {}), ...(ref ? { ref } : {}) };
+  return { ...(bill ? { kind: 'big' } : {}), ...base, name: titleCase(name), method, category };
 }
+
+const VPA = /(?:vpa|upi id)\s*:?\s*([\w.\-]+)@[\w.]+/i;
+// Axis & co: "UPI/P2A/512345678901/PRIYA SHARMA"
+const UPI_NAME = /\bupi\/p2[am]\/\d+\/([A-Za-z][A-Za-z&' .]{1,40}?)(?=\s*\/|\s+not\b|\s+avl|[.,]|$)/i;
+const INFO = /\binfo:?\s*(?:upi|pos|imps|neft|ach|ecom)?[-\/ ]*([A-Za-z][\w&' .]{1,30}?)(?=[.,]|\s+avl|\s+on\b|$)/i;
+const CREDIT_KINDS = [[/salary|payroll|\bsal\b/i, 'Salary'], [/refund|reversal|cashback/i, 'Refund'], [/interest|\bint\.? ?pd/i, 'Interest'], [/bonus/i, 'Bonus']];
 
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
 
@@ -379,17 +397,46 @@ function importMessage(text) {
   if (state.seenSms.includes(fp)) return { dup: parseSms(text) };
   const p = parseSms(text);
   if (!p) return null;
+  remember(fp);
+  moveBalance(p, fp);
   const same = p.ref && state.txns.find((t) => t.ref === p.ref);
-  if (same) return { dup: same };
+  if (same) {
+    // One UPI ref leaving one account and arriving in another: money moved between your own accounts.
+    if (same.kind === 'transfer' || (same.kind === 'credit') !== (p.dir === 'in')) {
+      const changes = { kind: 'transfer', category: 'Own account', method: '' };
+      Object.assign(same, changes);
+      save({ type: 'update', id: same.id, changes });
+      return { transfer: p };
+    }
+    return { dup: same };
+  }
   if (isSelf(p.name)) {
-    state.seenSms = [...state.seenSms, fp].slice(-500);
-    save({ type: 'seen', fp });
-    return { self: p };
+    addTxn({ ...p, kind: 'transfer', category: 'Own account', method: '' });
+    return { transfer: p };
   }
   addTxn(p);
-  state.seenSms = [...state.seenSms, fp].slice(-500);
-  save({ type: 'seen', fp });
   return p;
+}
+
+function remember(key) {
+  state.seenSms = [...state.seenSms, key].slice(-500);
+  save({ type: 'seen', fp: key });
+}
+
+/**
+ * Moves the savings account whose last digits are in the alert, once per payment (its SMS and email
+ * share a UPI ref). Alerts dated before the day you typed the balance are already in it.
+ */
+function moveBalance(p, fp) {
+  const d = p.acct;
+  const accounts = state.settings.accounts || [];
+  const acct = d && accounts.find((a) => (a.digits || '').length >= 3 && (d.endsWith(a.digits) || a.digits.endsWith(d)));
+  const key = `bal:${p.ref || fp}:${p.dir}`;
+  if (!acct || p.date < (acct.asOf || '') || state.seenSms.includes(key)) return null;
+  acct.balance = Math.round((Number(acct.balance) + (p.dir === 'in' ? p.amount : -p.amount)) * 100) / 100;
+  save({ type: 'settings', settings: { accounts } });
+  remember(key);
+  return acct;
 }
 
 /**
@@ -423,7 +470,7 @@ function addTxn({ name, category, amount, method = 'UPI', date = todayKey(), not
     time: `${pad(now.getHours())}:${pad(now.getMinutes())}`,
     name: name.trim(),
     category: category || (kind ? 'Other' : guessCategory(name)),
-    method: kind === 'credit' ? '' : method,
+    method: kind === 'credit' || kind === 'transfer' ? '' : method,
     amount,
     ...(kind ? { kind } : {}),
     ...(note.trim() ? { note: note.trim() } : {}),
@@ -448,7 +495,7 @@ function updateTxn(id, data) {
     amount,
     name: data.name.trim(),
     category: data.category,
-    method: kind === 'credit' ? '' : data.method,
+    method: kind === 'credit' || kind === 'transfer' ? '' : data.method,
     date: data.date || t.date,
     note: (data.note || '').trim(),
     kind,
@@ -991,6 +1038,7 @@ function renderMoney() {
   const invested = sumOf(state.settings.investments || [], investValue);
   const credits = state.txns.filter((t) => t.kind === 'credit').sort(newestFirst);
   const bigs = state.txns.filter((t) => t.kind === 'big').sort(newestFirst);
+  const moves = state.txns.filter((t) => t.kind === 'transfer').sort(newestFirst);
   const thisMonth = (t) => t.date >= ms && t.date <= k;
   const inM = sumOf(credits.filter(thisMonth));
   const bigM = sumOf(bigs.filter(thisMonth));
@@ -1014,7 +1062,7 @@ function renderMoney() {
         ${accounts.map((a) => `
           <div class="txn editable" data-account="${a.id}" role="button" tabindex="0" aria-label="Update ${esc(a.name)}">
             <div class="ico">${svgIcon('bank')}</div>
-            <div class="meta"><div class="name">${esc(a.name)}</div><div class="cat">updated ${shortDate(a.asOf)}</div></div>
+            <div class="meta"><div class="name">${esc(a.name)}</div><div class="cat">${a.digits ? `XX${esc(a.digits)} · auto-updates` : `set ${shortDate(a.asOf)} · tap to add last digits`}</div></div>
             <div class="amt plain">${inr(a.balance)}</div>
           </div>`).join('') || '<div class="empty" style="padding:8px 0">Add each bank account and its balance, then update it whenever you check your bank app.</div>'}
       </div>
@@ -1042,6 +1090,10 @@ function renderMoney() {
 
     <div class="label section-title">Big spends</div>
     ${list(bigs, 'Card bills, a new phone, flights… they stay out of your daily budget.')}
+
+    ${moves.length ? `
+      <div class="label section-title">Between your own accounts</div>
+      ${list(moves, '')}` : ''}
   `;
 }
 
@@ -1057,7 +1109,11 @@ function openAccountSheet(a = {}) {
         <label class="label" for="ac-balance">Balance now (₹)</label>
         <input id="ac-balance" name="balance" type="number" inputmode="decimal" min="0" step="any" value="${a.balance ?? ''}" required />
       </div>
-      <p class="hint">Just the number from your bank app. Nothing connects to your bank.</p>
+      <div class="field">
+        <label class="label" for="ac-digits">Last digits of the account number</label>
+        <input id="ac-digits" name="digits" inputmode="numeric" maxlength="6" pattern="\\d{3,6}" placeholder="e.g. 7788 (from XX7788 in alerts)" value="${esc(a.digits ?? '')}" />
+      </div>
+      <p class="hint">Just the number from your bank app. Nothing connects to your bank. With the last digits, every debit or credit alert for this account moves its balance.</p>
       <button class="btn" value="save">Save</button>
       ${a.id ? '<button class="btn danger" value="delete" formnovalidate>Remove account</button>' : ''}
       <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
@@ -1069,7 +1125,8 @@ function openAccountSheet(a = {}) {
 function accountFrom(data) {
   const balance = Number(data.balance);
   if (!data.name?.trim() || !(balance >= 0) || data.balance === '') return null;
-  return { name: data.name.trim(), balance, asOf: todayKey() };
+  const digits = String(data.digits || '').replace(/\D/g, '').slice(-6);
+  return { name: data.name.trim(), balance, asOf: todayKey(), ...(digits.length >= 3 ? { digits } : {}) };
 }
 
 /* ---------- Investments ---------- */
@@ -1377,6 +1434,8 @@ const KINDS = {
             hint: "Kept out of your daily budget, so one large payment doesn't wreck the day." },
   credit: { tab: 'Money in',    add: 'Add money received',   edit: 'Edit money received', what: 'From',  place: 'Salary, bonus, refund…',             cats: CREDIT_SOURCES,         cat: 'Salary',       noun: 'entry',
             hint: "A record of what came in. Your daily budget still comes from your monthly income in Settings." },
+  transfer: { tab: 'Transfer',  add: 'Add a transfer',       edit: 'Edit transfer',       what: 'Between', place: 'Axis → HDFC',                    cats: ['Own account'],        cat: 'Own account',  noun: 'transfer',
+            hint: 'Money moved between your own accounts. Not counted as spending or income.' },
 };
 
 /**
@@ -1393,7 +1452,7 @@ function openAddSheet(prefill = {}, { day } = {}) {
       <h2>${editing ? K.edit : K.add}</h2>
       <input type="hidden" name="kind" value="${kind}" />
       <div class="segmented kind-switch" role="radiogroup" aria-label="Type">
-        ${Object.entries(KINDS).map(([k, v]) => `<button type="button" role="radio" aria-checked="${k === kind}" data-kind="${k}" class="${k === kind ? 'on' : ''}">${v.tab}</button>`).join('')}
+        ${Object.entries(KINDS).filter(([k]) => k !== 'transfer' || kind === 'transfer').map(([k, v]) => `<button type="button" role="radio" aria-checked="${k === kind}" data-kind="${k}" class="${k === kind ? 'on' : ''}">${k ? v.tab : 'Daily'}</button>`).join('')}
       </div>
       ${K.hint ? `<p class="hint">${K.hint}</p>` : ''}
       <div class="field">
@@ -1411,7 +1470,7 @@ function openAddSheet(prefill = {}, { day } = {}) {
             ${K.cats.map((c) => `<option ${c === cat ? 'selected' : ''}>${c}</option>`).join('')}
           </select>
         </div>
-        ${kind === 'credit' ? '' : `
+        ${kind === 'credit' || kind === 'transfer' ? '' : `
         <div class="field">
           <label class="label" for="a-method">Paid via</label>
           <select id="a-method" name="method">
@@ -1491,7 +1550,7 @@ function openSmsSheet() {
   sheet.innerHTML = `
     <form method="dialog" id="sms-form">
       <h2>Paste bank / UPI alerts</h2>
-      <p class="hint">Reads “Sent Rs” (HDFC UPI), “debited”, “spent” and “paid” alerts. Paste one or many SMS or emails, with a blank line between emails. Each spend goes on the date written in the message, and anything already added is skipped.</p>
+      <p class="hint">Reads “Sent Rs” (HDFC UPI), “debited”, “spent”, “paid” and “credited” alerts. Paste one or many SMS or emails, with a blank line between emails. Each spend goes on the date written in the message, and anything already added is skipped.</p>
       <div class="field">
         <textarea name="sms" placeholder="Rs.250.00 debited from A/c XX1234 to VPA starbucks@hdfcbank on 02-11-26. UPI Ref 6312…" required></textarea>
       </div>
@@ -1543,16 +1602,21 @@ function handleSheet(form, value) {
     render();
   } else if (form.id === 'sms-form') {
     const results = splitMessages(data.sms).map(importMessage);
-    const added = results.filter((r) => r && !r.dup && !r.self);
+    const added = results.filter((r) => r && !r.dup && !r.transfer);
+    const spends = added.filter((p) => p.dir === 'out');
+    const credits = added.filter((p) => p.dir === 'in');
     const dups = results.filter((r) => r?.dup).map((r) => r.dup);
-    const selves = results.filter((r) => r?.self).map((r) => r.self);
+    // Both sides of one transfer share a ref: list it once.
+    const moves = results.filter((r) => r?.transfer).map((r) => r.transfer)
+      .filter((p, i, all) => !p.ref || all.findIndex((q) => q.ref === p.ref) === i);
     const parts = [];
-    if (added.length) parts.push(`Added ${added.length} spend${added.length > 1 ? 's' : ''} · ${inr(added.reduce((s, p) => s + p.amount, 0))}`);
-    if (selves.length) parts.push(`Not counted, transfer to your own account: ${selves.map((p) => inr(p.amount)).join(', ')}`);
+    if (spends.length) parts.push(`Added ${spends.length} spend${spends.length > 1 ? 's' : ''} · ${inr(sumOf(spends))}`);
+    if (credits.length) parts.push(`Money received · +${inr(sumOf(credits))}`);
+    if (moves.length) parts.push(`Moved between your own accounts, not counted: ${moves.map((p) => inr(p.amount)).join(', ')}`);
     // Name the duplicates, so a stale clipboard (the previous message pasted again) is easy to spot.
     if (dups.length) parts.push(`Already added: ${dups.map((p) => `${p.name} ${inr(p.amount)} (${shortDate(p.date)})`).join(', ')}`);
-    if (!parts.length) parts.push("No debit found in that. Paste the whole message, including the “Sent Rs” / “debited” line.");
-    toast(parts.join(' · '), dups.length || selves.length || !added.length ? 6000 : undefined);
+    if (!parts.length) parts.push("No debit or credit found in that. Paste the whole message, including the “Sent Rs” / “debited” / “credited” line.");
+    toast(parts.join(' · '), dups.length || moves.length || !added.length ? 6000 : undefined);
     render();
   }
 }
@@ -1608,11 +1672,11 @@ function importFromHash() {
   if (!state.settings.income) return toast('Set your monthly income first, then the message will be counted next time.');
   const p = importMessage(text);
   if (p?.dup) return toast(`Already added: ${p.dup.name} ${inr(p.dup.amount)} (${shortDate(p.dup.date)})`);
-  if (p?.self) return toast(`Not counted: ${inr(p.self.amount)} transfer to your own account`);
-  if (!p) return toast("No debit found in that message — nothing added");
-  tab = 'today';
+  if (p?.transfer) return toast(`Not counted: ${inr(p.transfer.amount)} moved between your own accounts`);
+  if (!p) return toast("No debit or credit found in that message — nothing added");
+  tab = p.dir === 'in' ? 'money' : 'today';
   render();
-  toast(`Auto-added −${inr(p.amount)} · ${p.name}`);
+  toast(`Auto-added ${p.dir === 'in' ? '+' : '−'}${inr(p.amount)} · ${p.name}`);
 }
 
 window.addEventListener('hashchange', importFromHash);
