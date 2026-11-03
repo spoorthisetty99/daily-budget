@@ -78,6 +78,7 @@ function signOut() {
   try { localStorage.removeItem(APPKEY_KEY); localStorage.removeItem(USER_KEY); } catch { /* private mode */ }
   serverMode = false;
   needKey = true;
+  loginMode = true; // only people who logged in with a username can log out
   render();
 }
 const api = (path, opts = {}) =>
@@ -1508,6 +1509,11 @@ function renderOnboarding() {
         <button class="btn" type="submit">Show my daily budget</button>
       </form>
     </section>
+    ${userName ? `
+      <section class="card signed-in" style="margin-top:14px">
+        <span>Logged in as <b>${esc(userName)}</b></span>
+        <button class="btn ghost" data-action="sign-out">Log out</button>
+      </section>` : ''}
   `;
 }
 
