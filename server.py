@@ -178,6 +178,8 @@ BALANCE_BEFORE = re.compile(r'(bal(ance)?|limit|avl\.?|available)\s*(is|:)?\s*$'
 VPA = re.compile(r'(?:vpa|upi id)\s*:?\s*([\w.\-]+)@[\w.]+', A)
 TO = re.compile(r"\b(?:to|at|towards)\s+(?:vpa\s+)?([A-Za-z][\w&' .\-]{1,40}?)"
                 r"(?=\s+(?:on|via|ref|upi|using|from|for|avl|a/c|\.|$)|[.,(]|@)", A)
+UPI_NAME = re.compile(r"\bupi/p2[am]/\d+/([A-Za-z][A-Za-z&' .]{1,40}?)(?=\s*/|\s+not\b|\s+avl|[.,]|$)", A)
+REF = re.compile(r"(?:\bref(?:erence)?(?:\s*no)?\.?|\brrn|\bupi(?:/p2[am])?)[\s:/#.-]*(\d{12})\b", A)
 INFO = re.compile(r"\binfo:?\s*(?:upi|pos|imps|neft|ach|ecom)?[-/ ]*([A-Za-z][\w&' .]{1,30}?)"
                   r"(?=[.,]|\s+avl|\s+on\b|$)", A)
 
@@ -256,12 +258,14 @@ def parse_sms(text, fixed=()):
         return None
     if amount <= 0:
         return None
-    to, info, vpa = TO.search(text), INFO.search(text), VPA.search(text)
-    name = (to or info or vpa)[1] if (to or info or vpa) else ''
+    hit = TO.search(text) or UPI_NAME.search(text) or INFO.search(text) or VPA.search(text)
+    name = hit[1] if hit else ''
     name = re.sub(r'\s+', ' ', re.sub(r'[._\-]+', ' ', name)).strip() or 'UPI payment'
     name = name[:22]
     method = 'Card' if re.search('card', text, re.I) else 'Cash' if re.search('atm|withdrawn', text, re.I) else 'UPI'
+    ref = REF.search(text)
     return {
+        **({'ref': ref[1]} if ref else {}),
         'name': title_case(name),
         'amount': int(amount) if amount.is_integer() else amount,
         'method': method,
@@ -295,7 +299,11 @@ def add_from_sms(text):
         p = parse_sms(text, s['settings'].get('fixed'))
         if not p:
             return 'No debit found in that message, nothing added.'
+        same = p.get('ref') and next((x for x in s['txns'] if x.get('ref') == p['ref']), None)
+        if same:
+            return f"Already added: {same['name']} {inr(same['amount'])} (same payment's SMS or email)."
         s['txns'].append({
+            **({'ref': p['ref']} if p.get('ref') else {}),
             'id': str(uuid.uuid4()),
             'date': p['date'],
             'time': now().strftime('%H:%M'),
@@ -403,6 +411,9 @@ def respond(method, target, headers, body):
             except (ValueError, KeyError, TypeError):
                 return 400, TEXT, b'Bad request'
             return 200, JSON, json.dumps(apply_ops(ops), ensure_ascii=False).encode()
+        if path.startswith('/api/sms'):
+            return 404, TEXT, ('Shortcut setup: the message ended up in the URL. Set the URL to exactly '
+                               '.../api/sms and put Content in the Request Body (JSON, key "text").').encode()
         return 404, TEXT, b'Not found'
     if method in ('GET', 'HEAD') and path in STATIC:
         name = 'index.html' if path == '/' else path[1:]

@@ -290,14 +290,19 @@ function parseSms(text) {
   let name = '';
   const vpa = text.match(/(?:vpa|upi id)\s*:?\s*([\w.\-]+)@[\w.]+/i);
   const to = text.match(/\b(?:to|at|towards)\s+(?:vpa\s+)?([A-Za-z][\w&' .\-]{1,40}?)(?=\s+(?:on|via|ref|upi|using|from|for|avl|a\/c|\.|$)|[.,(]|@)/i);
+  // Axis & co: "UPI/P2A/512345678901/PRIYA SHARMA"
+  const upi = text.match(/\bupi\/p2[am]\/\d+\/([A-Za-z][A-Za-z&' .]{1,40}?)(?=\s*\/|\s+not\b|\s+avl|[.,]|$)/i);
   const info = text.match(/\binfo:?\s*(?:upi|pos|imps|neft|ach|ecom)?[-\/ ]*([A-Za-z][\w&' .]{1,30}?)(?=[.,]|\s+avl|\s+on\b|$)/i);
   if (to) name = to[1];
+  else if (upi) name = upi[1];
   else if (info) name = info[1];
   else if (vpa) name = vpa[1];
   name = name.replace(/[._\-]+/g, ' ').replace(/\s+/g, ' ').trim() || 'UPI payment';
   name = name.length > 22 ? name.slice(0, 22) : name;
   const method = /card/i.test(text) ? 'Card' : /atm|withdrawn/i.test(text) ? 'Cash' : 'UPI';
-  return { name: titleCase(name), amount, method, category: guessCategory(name), date: dateInText(text) };
+  // The UPI reference is the same in the SMS and the email for one payment, so it catches cross-channel duplicates.
+  const ref = text.match(/(?:\bref(?:erence)?(?:\s*no)?\.?|\brrn|\bupi(?:\/p2[am])?)[\s:\/#.-]*(\d{12})\b/i)?.[1];
+  return { name: titleCase(name), amount, method, category: guessCategory(name), date: dateInText(text), ...(ref ? { ref } : {}) };
 }
 
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
@@ -345,6 +350,8 @@ function importMessage(text) {
   if (state.seenSms.includes(fp)) return { dup: parseSms(text) };
   const p = parseSms(text);
   if (!p) return null;
+  const same = p.ref && state.txns.find((t) => t.ref === p.ref);
+  if (same) return { dup: same };
   addTxn(p);
   state.seenSms = [...state.seenSms, fp].slice(-500);
   save({ type: 'seen', fp });
@@ -355,7 +362,7 @@ const titleCase = (s) => s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()
 
 /* ================= Mutations ================= */
 
-function addTxn({ name, category, amount, method = 'UPI', date = todayKey(), note = '' }) {
+function addTxn({ name, category, amount, method = 'UPI', date = todayKey(), note = '', ref }) {
   amount = Number(amount);
   if (!name || !(amount > 0)) return false;
   const ops = [];
@@ -374,6 +381,7 @@ function addTxn({ name, category, amount, method = 'UPI', date = todayKey(), not
     method,
     amount,
     ...(note.trim() ? { note: note.trim() } : {}),
+    ...(ref ? { ref } : {}),
   };
   state.txns.push(txn);
   save(...ops, { type: 'add', txn });
