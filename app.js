@@ -59,6 +59,16 @@ let userName = '';
 try { appKey = localStorage.getItem(APPKEY_KEY) || ''; userName = localStorage.getItem(USER_KEY) || ''; } catch { /* private mode */ }
 let needKey = false;
 let loginMode = false; // the server has users: ask for a username and password, not a key
+let isAdmin = false;    // may add people (Settings → People)
+let people = null;      // the logins, loaded when an admin opens Settings
+
+async function checkMe() {
+  try {
+    const me = await (await api('api/me', { cache: 'no-store' })).json();
+    isAdmin = !!me.admin;
+    if (me.user && me.user !== userName) { userName = me.user; localStorage.setItem(USER_KEY, userName); }
+  } catch { /* offline or an older server */ }
+}
 
 async function checkLoginMode() {
   try { loginMode = !!(await (await fetch('api/auth', { cache: 'no-store' })).json()).users; } catch { /* offline */ }
@@ -75,6 +85,8 @@ function forgetLocalData() {
 function signOut() {
   forgetLocalData();
   appKey = userName = '';
+  isAdmin = false;
+  people = null;
   try { localStorage.removeItem(APPKEY_KEY); localStorage.removeItem(USER_KEY); } catch { /* private mode */ }
   serverMode = false;
   needKey = true;
@@ -157,6 +169,7 @@ async function connect() {
   }
   const remote = await res.json();
   serverMode = true;
+  await checkMe();
   if (!remote.settings?.income && state.settings.income) {
     outbox.unshift({ type: 'replace', state: shareable(state) });
   } else if (!outbox.length) {
@@ -1311,6 +1324,81 @@ function saveListItem(key, id, remove, build) {
   return true;
 }
 
+/* ---------- People (admin): add logins from the app ---------- */
+
+function peopleSection() {
+  if (!people) loadPeople();
+  return `
+    <div class="label section-title">People</div>
+    <section class="card">
+      <p class="sub" style="margin-top:0">Each person logs in with their own username and password and starts with an empty budget. Only they see their data.</p>
+      <div class="txn-list" style="margin:12px 0">
+        ${people ? people.map((p) => `
+          <div class="txn">
+            <div class="ico">${svgIcon('dot')}</div>
+            <div class="meta"><div class="name">${esc(p.name)}</div><div class="cat">${p.admin ? 'admin · can add people' : 'own login and data'}</div></div>
+          </div>`).join('') : '<div class="empty" style="padding:8px 0">Loading…</div>'}
+      </div>
+      <button class="btn ghost" data-action="add-person">+ Add a person</button>
+    </section>`;
+}
+
+async function loadPeople() {
+  try {
+    const res = await api('api/users', { cache: 'no-store' });
+    if (!res.ok) return;
+    people = (await res.json()).users;
+    if (tab === 'settings' && !isEditing()) render();
+  } catch { /* offline */ }
+}
+
+function openPersonSheet() {
+  sheet.innerHTML = `
+    <form method="dialog" id="person-form">
+      <h2>Add a person</h2>
+      <p class="hint">They get their own login and an empty budget. Send them the username, password and the link to this app.</p>
+      <div class="field">
+        <label class="label" for="p-name">Username</label>
+        <input id="p-name" name="username" maxlength="20" pattern="[a-z0-9_\\-]{2,20}" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="e.g. joel" required />
+        <small class="hint">Lowercase letters, numbers, - or _</small>
+      </div>
+      <div class="field">
+        <label class="label" for="p-pass">Password for them</label>
+        <input id="p-pass" name="password" type="text" minlength="8" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false" required />
+        <small class="hint">At least 8 characters. Shown here so you can send it to them.</small>
+      </div>
+      <button class="btn" value="save">Create login</button>
+      <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
+    </form>`;
+  showSheet();
+  $('#p-name', sheet).focus();
+}
+
+async function addPerson(data) {
+  const username = String(data.username || '').trim().toLowerCase();
+  let res;
+  try {
+    res = await api('api/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password: data.password }) });
+  } catch {
+    return toast("Can't reach the server right now");
+  }
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) return toast(out.error || "Couldn't add them", 5000);
+  people = out.users;
+  render();
+  toast(`${username} can now log in at ${location.host}`, 6000);
+}
+
+/** Saves this person's whole budget as a JSON file on the phone. */
+function downloadBackup() {
+  const blob = new Blob([JSON.stringify(shareable(state), null, 1)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `budget-backup-${userName || 'me'}-${todayKey()}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
 function renderSettings() {
   const s = state.settings;
   const perm = 'Notification' in window ? Notification.permission : 'unsupported';
@@ -1382,6 +1470,13 @@ function renderSettings() {
       <button class="btn ghost" data-action="demo">Load demo data</button>
       <button class="btn danger" data-action="reset">Erase everything</button>
     </section>
+    ${serverMode ? `
+      <div class="label section-title">Backups</div>
+      <section class="card">
+        <p class="sub" style="margin-top:0">The server keeps a copy of your data from each of the last 14 days, so a mistake (even “Erase everything”) can be undone. You can also keep your own copy.</p>
+        <button class="btn ghost" data-action="backup">Download a backup</button>
+      </section>` : ''}
+    ${isAdmin ? peopleSection() : ''}
     ${userName ? `
       <div class="label section-title">Account</div>
       <section class="card">
@@ -1685,6 +1780,8 @@ function handleSheet(form, value) {
       toast(`${sign}${inr(Number(data.amount))} · ${data.name}${data.kind === 'big' ? ' · big spend, daily budget unchanged' : ''}`);
       render();
     }
+  } else if (form.id === 'person-form') {
+    addPerson(data);
   } else if (form.id === 'account-form') {
     const removed = value === 'delete';
     if (saveListItem('accounts', form.dataset.id, removed, () => accountFrom(data))) toast(removed ? 'Account removed' : 'Balance saved');
@@ -1882,6 +1979,8 @@ view.addEventListener('click', async (e) => {
   } else if (t.dataset.action === 'sms') openSmsSheet();
   else if (t.dataset.action === 'export') exportCsv();
   else if (t.dataset.action === 'add-fixed') openFixedSheet();
+  else if (t.dataset.action === 'add-person') openPersonSheet();
+  else if (t.dataset.action === 'backup') downloadBackup();
   else if (t.dataset.action === 'sign-out') {
     if (confirm('Log out on this phone? Your data stays safe on the server.')) signOut();
   }

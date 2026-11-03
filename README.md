@@ -94,6 +94,14 @@ python3 server.py users                            # list users and their app ke
 ```
 
 Logging in gives the phone that person's app key, which their automations also use. **Log out** is in Settings.
+
+**Adding people from the app:** the first login (or anyone marked `"admin": true` in `users.json`) is the admin and
+sees **Settings → People → Add a person**: pick a username and password, and they can log in straight away with an
+empty budget. Only admins can add people.
+
+**Backups:** every save also keeps that day's copy in `data/backups/<name>/<date>.json`; the last 14 days are kept.
+To undo a mistake, copy an older day's file over `data/<name>.json` (PythonAnywhere: Files tab or a Bash console).
+**Settings → Backups → Download a backup** saves your own copy on the phone.
 With no users created, the app runs as before: one shared `data.json`, guarded by `BUDGET_KEY` if that is set.
 
 ## Install on your phone
