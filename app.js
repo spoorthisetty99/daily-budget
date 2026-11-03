@@ -169,8 +169,10 @@ const fixedTotal = () => (state.settings.fixed || []).reduce((s, f) => s + Numbe
 const spendable = () => Math.max(0, state.settings.income - fixedTotal());
 const baseDaily = (k) => spendable() / daysInMonth(k);
 
-// Spends in the "Fixed" category were already set aside, so they don't eat the daily budget.
-const counts = (t) => t.category !== 'Fixed';
+// "Fixed" spends were already set aside, and a "Card bill" only pays off card spends already logged,
+// so neither eats the daily budget.
+const NOT_COUNTED = ['Fixed', 'Card bill'];
+const counts = (t) => !NOT_COUNTED.includes(t.category);
 
 const spentOn = (k) => state.txns.filter((t) => t.date === k && counts(t)).reduce((s, t) => s + t.amount, 0);
 
@@ -217,6 +219,7 @@ const ICONS = {
   shirt: '<path d="M8 4 4 7l2 4 2-1v10h8V10l2 1 2-4-4-3a4 4 0 0 1-8 0Z"/>',
   dot: '<circle cx="12" cy="12" r="4"/>',
   home: '<path d="M4 11 12 4l8 7"/><path d="M6 10v10h12V10"/><path d="M10 20v-5h4v5"/>',
+  card: '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M3 10h18M7 15h3"/>',
 };
 
 const CATEGORIES = {
@@ -229,6 +232,7 @@ const CATEGORIES = {
   'Entertainment': 'film',
   'Health':        'heart',
   'Fixed':         'home', // rent, SIP, EMI: set aside up front, not counted against the day
+  'Card bill':     'card', // paying off the credit card: its purchases were already counted
   'Other':         'dot',
 };
 
@@ -258,8 +262,11 @@ const isFixedName = (name, fixed = state.settings.fixed || []) => {
   });
 };
 
+// "Credit card bill", "CC payment", CRED… (in a spend's name or anywhere in a bank alert).
+const CARD_BILL = /credit ?card (bill|payment|dues)|card ?bill|\bcc (bill|payment)|\bcred\b|towards (your )?([a-z]+ )*credit card/i;
+
 const guessCategory = (name) =>
-  isFixedName(name) ? 'Fixed' : (MERCHANTS.find(([re]) => re.test(name)) || [, 'Other'])[1];
+  isFixedName(name) ? 'Fixed' : CARD_BILL.test(name) ? 'Card bill' : (MERCHANTS.find(([re]) => re.test(name)) || [, 'Other'])[1];
 
 const QUICK_ADD = [
   { name: 'Coffee', category: 'Food & drink', amount: 250 },
@@ -303,7 +310,9 @@ function parseSms(text) {
   const method = /card/i.test(text) ? 'Card' : /atm|withdrawn/i.test(text) ? 'Cash' : 'UPI';
   // The UPI reference is the same in the SMS and the email for one payment, so it catches cross-channel duplicates.
   const ref = text.match(/(?:\bref(?:erence)?(?:\s*no)?\.?|\brrn|\bupi(?:\/p2[am])?)[\s:\/#.-]*(\d{12})\b/i)?.[1];
-  return { name: titleCase(name), amount, method, category: guessCategory(name), date: dateInText(text), ...(ref ? { ref } : {}) };
+  const category = CARD_BILL.test(text) ? 'Card bill' : guessCategory(name);
+  if (category === 'Card bill' && /credit|card|upi payment/i.test(name)) name = 'Credit card bill'; // not "Your Hdfc Bank Credit"
+  return { name: titleCase(name), amount, method, category, date: dateInText(text), ...(ref ? { ref } : {}) };
 }
 
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
@@ -454,7 +463,7 @@ function txnHtml(t) {
       <div class="ico">${icon(t.category, t.name)}</div>
       <div class="meta">
         <div class="name">${esc(t.name)}</div>
-        <div class="cat">${esc(t.category)}${t.category === 'Fixed' ? ' (set aside)' : ''} · ${esc(t.method)}</div>
+        <div class="cat">${esc(t.category)}${t.category === 'Fixed' ? ' (set aside)' : t.category === 'Card bill' ? ' (not counted)' : ''} · ${esc(t.method)}</div>
         ${t.note ? `<div class="note">${esc(t.note)}</div>` : ''}
       </div>
       <div class="amt">−${inr(t.amount)}</div>
@@ -803,7 +812,8 @@ view.addEventListener('pointerout', (e) => { const w = e.target.closest?.('.char
 function renderInsights() {
   const k = todayKey();
   const from = insightRange === 'week' ? addDays(k, -6) : insightRange === 'month' ? monthStart(k) : '0000-00-00';
-  const txns = state.txns.filter((t) => t.date >= from && t.date <= k);
+  // A card bill would count its purchases a second time.
+  const txns = state.txns.filter((t) => t.date >= from && t.date <= k && t.category !== 'Card bill');
   const total = txns.reduce((s, t) => s + t.amount, 0);
 
   const byCat = {};
@@ -873,7 +883,7 @@ function detectSubscriptions() {
       out.push({ name: latest.name, amount: latest.amount, reason: '' });
       continue;
     }
-    if (latest.category === 'Bills' || latest.category === 'Fixed') continue; // rent, EMIs etc. recur but aren't subscriptions
+    if (['Bills', ...NOT_COUNTED].includes(latest.category)) continue; // rent, EMIs etc. recur but aren't subscriptions
     const months = new Set(list.map((t) => t.date.slice(0, 7)));
     const amounts = list.map((t) => t.amount);
     const similar = Math.max(...amounts) <= Math.min(...amounts) * 1.1;

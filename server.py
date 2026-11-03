@@ -116,14 +116,18 @@ def inr(n):
 
 # ================= Budget engine (mirrors app.js) =================
 
-# "Fixed" spends (rent, SIP…) were set aside up front, so they don't eat the daily budget.
+# "Fixed" spends (rent, SIP…) were set aside up front, and a "Card bill" only pays off card spends
+# already logged, so neither eats the daily budget.
+NOT_COUNTED = ('Fixed', 'Card bill')
+
+
 def spent_on(s, k):
-    return sum(t['amount'] for t in s['txns'] if t['date'] == k and t.get('category') != 'Fixed')
+    return sum(t['amount'] for t in s['txns'] if t['date'] == k and t.get('category') not in NOT_COUNTED)
 
 
 def spent_between(s, start, end_exclusive):
     return sum(t['amount'] for t in s['txns']
-               if start <= t['date'] < end_exclusive and t.get('category') != 'Fixed')
+               if start <= t['date'] < end_exclusive and t.get('category') not in NOT_COUNTED)
 
 
 def fixed_total(s):
@@ -180,6 +184,8 @@ TO = re.compile(r"\b(?:to|at|towards)\s+(?:vpa\s+)?([A-Za-z][\w&' .\-]{1,40}?)"
                 r"(?=\s+(?:on|via|ref|upi|using|from|for|avl|a/c|\.|$)|[.,(]|@)", A)
 UPI_NAME = re.compile(r"\bupi/p2[am]/\d+/([A-Za-z][A-Za-z&' .]{1,40}?)(?=\s*/|\s+not\b|\s+avl|[.,]|$)", A)
 REF = re.compile(r"(?:\bref(?:erence)?(?:\s*no)?\.?|\brrn|\bupi(?:/p2[am])?)[\s:/#.-]*(\d{12})\b", A)
+CARD_BILL = re.compile(r"credit ?card (bill|payment|dues)|card ?bill|\bcc (bill|payment)|\bcred\b"
+                       r"|towards (your )?([a-z]+ )*credit card", A)
 INFO = re.compile(r"\binfo:?\s*(?:upi|pos|imps|neft|ach|ecom)?[-/ ]*([A-Za-z][\w&' .]{1,30}?)"
                   r"(?=[.,]|\s+avl|\s+on\b|$)", A)
 
@@ -218,6 +224,8 @@ def is_self(name, mine):
 def guess_category(name, fixed=()):
     if is_fixed_name(name, fixed):
         return 'Fixed'
+    if CARD_BILL.search(name):
+        return 'Card bill'
     return next((c for pat, c in MERCHANTS if re.search(pat, name, re.I)), 'Other')
 
 
@@ -271,13 +279,16 @@ def parse_sms(text, fixed=()):
     name = re.sub(r'\s+', ' ', re.sub(r'[._\-]+', ' ', name)).strip() or 'UPI payment'
     name = name[:22]
     method = 'Card' if re.search('card', text, re.I) else 'Cash' if re.search('atm|withdrawn', text, re.I) else 'UPI'
+    category = 'Card bill' if CARD_BILL.search(text) else guess_category(name, fixed)
+    if category == 'Card bill' and re.search(r'credit|card|upi payment', name, re.I):
+        name = 'Credit card bill'  # not "Your Hdfc Bank Credit"
     ref = REF.search(text)
     return {
         **({'ref': ref[1]} if ref else {}),
         'name': title_case(name),
         'amount': int(amount) if amount.is_integer() else amount,
         'method': method,
-        'category': guess_category(name, fixed),
+        'category': category,
         'date': date_in_text(text),
     }
 
@@ -337,6 +348,8 @@ def add_from_sms(text):
             line += f" ({d.day} {d.strftime('%b')})"
         if p['category'] == 'Fixed':
             return f'{line}\nFixed cost, already set aside. Daily budget unchanged.'
+        if p['category'] == 'Card bill':
+            return f'{line}\nCard bill, not counted: its purchases already were. Daily budget unchanged.'
         left = budget_for(s, k) - spent_on(s, k)
         status = f'{inr(left)} left today' if left >= 0 else f"{inr(-left)} over today's budget"
         return f'{line}\n{status}'
