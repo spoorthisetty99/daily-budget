@@ -29,6 +29,10 @@ which goes green → yellow → red as it drains. At night you get a
   the same merchant charging a similar amount in two or more months) with monthly/yearly cost.
 - **Spending trend** (Insights) — daily / weekly / monthly bars against the budget, a trend line, and
   "↓ 12% spending down: last 7 days vs the 7 before". Fixed costs and incomplete periods are left out.
+- **Money tab** — bank balances (the total also shows on Today), money coming in, and big one-off spends kept out of
+  the daily budget. Transfers between your own accounts and card bill payments don't count as spending.
+- **Invest tab** — a simple record of stocks, FDs, mutual funds, bonds, PF and so on.
+- **Logins and backups** — each person gets their own data, with daily backups kept for 14 days.
 - CSV export, demo data, installable on iPhone and Android home screens.
 
 ## Run it
@@ -53,17 +57,15 @@ PythonAnywhere's free plan stays on, keeps files, and gives you HTTPS (needed to
    ```bash
    git clone https://github.com/spoorthisetty99/daily-budget.git
    ```
-   The repo is private, so git asks for your GitHub username and a password: use a **personal access token**
-   (GitHub → Settings → Developer settings → Fine-grained tokens → only this repo, *Contents: Read-only*).
-3. **Files** → open `daily-budget/` → **Upload a file** → your PC's `Desktop\expense\data.json` (your spends so far).
-4. Back in the Bash console, create the logins (each asks for a password, twice):
+3. Optional, if you already have spends on a PC: **Files** → open `daily-budget/` → **Upload a file** → that PC's `data.json`.
+4. Back in the Bash console, create your login (it asks for a password, twice):
    ```bash
    cd daily-budget
-   python3 server.py adduser spoorthi --import data.json
-   python3 server.py adduser <friend>
+   python3 server.py adduser <you>
    ```
-   The first one starts from your uploaded spends; the second starts empty, a clean slate. Each prints that
-   person's **app key** for their phone automations (`python3 server.py users` shows them again).
+   Add `--import data.json` to start from an uploaded file. The first login is the admin, and it prints that
+   person's **app key** for their phone automations (`python3 server.py users` shows it again). Add everyone else
+   later from **Settings → People** in the app.
 5. **Web → Add a new web app → Manual configuration →** the newest Python 3.
 6. On the Web tab, open the **WSGI configuration file** link, delete everything in it, and paste (with your username):
    ```python
@@ -83,8 +85,8 @@ emails a week before the site would pause; your data is kept either way).
 ## Logins
 
 Every person has a username and password and sees only their own spends, banks and investments (stored in
-`data/<name>.json`, next to `users.json`; both git-ignored and never served). There is no sign-up page: you
-create logins in a console, so strangers can't make accounts.
+`data/<name>.json`, next to `users.json`; both git-ignored and never served). There is no sign-up page, so strangers
+can't make accounts: an admin adds people in the app (below) or in a console.
 
 ```bash
 python3 server.py adduser NAME                     # new, empty account
@@ -125,20 +127,23 @@ Android has no Shortcuts app; the free **MacroDroid** app does the same job.
 
 ## iPhone: auto-add from SMS & email in the background (no bank connection)
 
-iOS doesn't let apps read your messages, but a **Shortcuts automation** can send each bank alert to the PC.
+iOS doesn't let apps read your messages, but a **Shortcuts automation** can send each bank alert to your server.
 Nothing opens on the phone; you just get a notification like `−₹350 · Ravi Stores 2 / ₹2,983 left today`.
 
 1. Shortcuts → Automation → **+** → **Message** → *Message Contains* `Sent Rs` → **Run Immediately** → New Blank Automation.
-2. **Get Contents of URL** → `http://<PC-IP>:5173/api/sms`, Method **POST**, Request Body **JSON**,
-   Text field `text` = **Shortcut Input › Content**.
+2. **Get Contents of URL** → `https://<username>.pythonanywhere.com/api/sms`, Method **POST**, header
+   `X-Budget-Key` = your app key, Request Body **JSON**, Text field `text` = **Shortcut Input › Content**.
 3. **Show Notification** → **Contents of URL**.
-4. Banks word alerts differently (HDFC UPI: `Sent Rs.…`, others: `debited`, cards: `spent`), so make one automation
-   per wording. For bank emails use the **Email** trigger and the email **Body**.
-5. Nightly summary: **Time of Day** automation → **Get Contents of URL** `http://<PC-IP>:5173/api/summary` →
-   **Show Notification**.
+4. Banks word alerts differently (HDFC UPI: `Sent Rs.…`, others: `debited`, cards: `spent`, money in: `credited`), so
+   make one automation per wording. For bank emails use the **Email** trigger and the email **Body**.
+5. Nightly summary: **Time of Day** automation → **Get Contents of URL** `https://<username>.pythonanywhere.com/api/summary`
+   (same header) → **Show Notification**.
 
-Balances ("Avl Bal Rs …") are ignored, credits go under Money received, the date in the message is used, and the
-same message is never counted twice. The steps, with copy buttons for both URLs, are also in the app under Settings.
+Running the PC server instead? Use `http://<PC-IP>:5173` as the address; the phone must be on the same Wi-Fi.
+
+The "Avl Bal Rs …" figure in an alert is never mistaken for a spend, credits go to the Money tab, the date in the
+message is used, and the same message is never counted twice. If an alert names an account whose last digits you've
+saved, that account's balance updates too. The steps, with copy buttons for both URLs, are also in the app under Settings.
 
 Older alerts (before the automation existed): copy them from Messages / Mail and use **Paste SMS** on the Today tab.
 
