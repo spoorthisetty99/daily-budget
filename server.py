@@ -453,10 +453,7 @@ def remember(s, key):
 def move_balance(s, p, fp):
     """Moves the savings account whose last digits are in the alert, once per payment (its SMS and email
     share a UPI ref). Alerts dated before the day you typed the balance are already in it."""
-    digits = p.get('acct')
-    acct = digits and next((a for a in s['settings'].get('accounts') or []
-                            if len(a.get('digits') or '') >= 3
-                            and (digits.endswith(a['digits']) or a['digits'].endswith(digits))), None)
+    acct = match_account(s, p.get('acct'))
     key = f"bal:{p.get('ref') or fp}:{p['dir']}"
     if not acct or p['date'] < (acct.get('asOf') or '') or key in s['seenSms']:
         return None
@@ -466,13 +463,21 @@ def move_balance(s, p, fp):
     return acct
 
 
-def record_alert(s, p):
-    """Adds the spend or money received. Returns ('added' | 'dup' | 'transfer', txn)."""
+def match_account(s, digits):
+    """The savings account whose saved last digits match an alert's."""
+    return digits and next((a for a in s['settings'].get('accounts') or []
+                            if len(a.get('digits') or '') >= 3
+                            and (digits.endswith(a['digits']) or a['digits'].endswith(digits))), None)
+
+
+def record_alert(s, p, acct=None, moved=False):
+    """Adds the spend or money received, linked to its account (or flagged so the app asks which one paid).
+    Returns ('added' | 'dup' | 'transfer', txn)."""
     same = p.get('ref') and next((x for x in s['txns'] if x.get('ref') == p['ref']), None)
     if same:
         # One UPI ref leaving one account and arriving in another: money moved between your own accounts.
         if same.get('kind') == 'transfer' or (same.get('kind') == 'credit') != (p['dir'] == 'in'):
-            same.update(kind='transfer', category='Own account', method='')
+            same.update(kind='transfer', category='Own account', method='', acct='', bal=0, ask=False)
             return 'transfer', same
         return 'dup', same
     t = {
@@ -490,6 +495,11 @@ def record_alert(s, p):
         t.update(kind='transfer', category='Own account', method='')
     elif p.get('kind'):
         t['kind'] = p['kind']
+    if t.get('kind') != 'transfer':
+        if acct:
+            t.update(acct=acct['id'], bal=(p['amount'] if p['dir'] == 'in' else -p['amount']) if moved else 0)
+        elif st.get('accounts'):
+            t['ask'] = True
     s['txns'].append(t)
     if not t.get('kind') and st.get('startDate') and p['date'] < st['startDate']:
         st['startDate'] = p['date']
@@ -509,11 +519,14 @@ def add_from_sms(text):
         if not p:
             return 'No debit or credit found in that message, nothing added.'
         remember(s, fp)
-        acct = move_balance(s, p, fp)
-        what, t = record_alert(s, p)
+        acct = match_account(s, p.get('acct'))
+        moved = move_balance(s, p, fp)
+        what, t = record_alert(s, p, acct, bool(moved))
         store(s)
 
-        bal = f"\n{acct['name']}: {inr(acct['balance'])}" if acct else ''
+        bal = f"\n{moved['name']}: {inr(moved['balance'])}" if moved else ''
+        if what == 'added' and t.get('ask'):
+            bal = '\nWhich account paid? Pick it on the Today tab.'
         if what == 'dup':
             return f"Already added: {t['name']} {inr(t['amount'])} (same payment's SMS or email).{bal}"
         if what == 'transfer':
@@ -551,6 +564,12 @@ def apply_ops(ops):
                 s['txns'] = [x for x in s['txns'] if x['id'] != op['id']]
             elif kind == 'settings':
                 s['settings'].update(op['settings'])
+            elif kind == 'balance':
+                # A spend picked an account in the app: a change, so alerts applied meanwhile survive.
+                for a in s['settings'].get('accounts') or []:
+                    if a.get('id') == op.get('id'):
+                        moved = round(float(a.get('balance') or 0) + float(op.get('delta') or 0), 2)
+                        a['balance'] = int(moved) if moved.is_integer() else moved
             elif kind == 'seen':
                 if op['fp'] not in s['seenSms']:
                     s['seenSms'] = (s['seenSms'] + [op['fp']])[-500:]

@@ -440,12 +440,13 @@ function importMessage(text) {
   const p = parseSms(text);
   if (!p) return null;
   remember(fp);
-  moveBalance(p, fp);
+  const acct = accountByDigits(p.acct);
+  const moved = moveBalance(p, fp);
   const same = p.ref && state.txns.find((t) => t.ref === p.ref);
   if (same) {
     // One UPI ref leaving one account and arriving in another: money moved between your own accounts.
     if (same.kind === 'transfer' || (same.kind === 'credit') !== (p.dir === 'in')) {
-      const changes = { kind: 'transfer', category: 'Own account', method: '' };
+      const changes = { kind: 'transfer', category: 'Own account', method: '', acct: '', bal: 0, ask: false };
       Object.assign(same, changes);
       save({ type: 'update', id: same.id, changes });
       return { transfer: p };
@@ -453,11 +454,17 @@ function importMessage(text) {
     return { dup: same };
   }
   if (isSelf(p.name)) {
-    addTxn({ ...p, kind: 'transfer', category: 'Own account', method: '' });
+    addTxn({ ...p, acct: undefined, kind: 'transfer', category: 'Own account', method: '' });
     return { transfer: p };
   }
-  addTxn(p);
-  return p;
+  // No saved account has these last digits: the Today tab asks which one paid.
+  const t = addTxn({
+    ...p,
+    acct: acct?.id,
+    bal: moved ? (p.dir === 'in' ? p.amount : -p.amount) : 0,
+    ask: !acct && (state.settings.accounts || []).length > 0,
+  });
+  return { ...p, ask: !!t?.ask };
 }
 
 function remember(key) {
@@ -470,9 +477,8 @@ function remember(key) {
  * share a UPI ref). Alerts dated before the day you typed the balance are already in it.
  */
 function moveBalance(p, fp) {
-  const d = p.acct;
   const accounts = state.settings.accounts || [];
-  const acct = d && accounts.find((a) => (a.digits || '').length >= 3 && (d.endsWith(a.digits) || a.digits.endsWith(d)));
+  const acct = accountByDigits(p.acct);
   const key = `bal:${p.ref || fp}:${p.dir}`;
   if (!acct || p.date < (acct.asOf || '') || state.seenSms.includes(key)) return null;
   acct.balance = Math.round((Number(acct.balance) + (p.dir === 'in' ? p.amount : -p.amount)) * 100) / 100;
@@ -480,6 +486,72 @@ function moveBalance(p, fp) {
   remember(key);
   return acct;
 }
+
+/** The savings account whose saved last digits match an alert's. */
+function accountByDigits(d) {
+  return d && (state.settings.accounts || []).find((a) => (a.digits || '').length >= 3 && (d.endsWith(a.digits) || a.digits.endsWith(d)));
+}
+
+const roundRs = (n) => Math.round(Number(n) * 100) / 100;
+
+/** What a transaction does to the account it went through: money in adds, spends take away, transfers neither. */
+const txnDelta = (t) => (t.kind === 'transfer' ? 0 : t.kind === 'credit' ? t.amount : -t.amount);
+
+/**
+ * Moves one account's balance and returns the op that does the same on the server. A change, not the new
+ * balance, so an alert the server applied meanwhile isn't overwritten.
+ */
+function moveAccount(acct, delta) {
+  acct.balance = roundRs(Number(acct.balance) + delta);
+  return { type: 'balance', id: acct.id, delta };
+}
+
+/**
+ * Gives back to its account what a transaction took (or takes back what it added). A balance typed
+ * after the transaction's day already reflects it, so that stays as typed. Returns the ops to save.
+ */
+function unlinkAccount(t) {
+  const acct = t.acct && (state.settings.accounts || []).find((a) => a.id === t.acct);
+  const ops = acct && t.bal && t.date >= (acct.asOf || '') ? [moveAccount(acct, -t.bal)] : [];
+  t.bal = 0;
+  return ops;
+}
+
+/**
+ * Points a transaction at the account it was paid from or into ('' = cash, not from a bank) and moves
+ * that balance. Like alerts, transactions dated before the day you typed a balance are already in it.
+ * Returns the ops to save and the account.
+ */
+function linkAccount(t, id) {
+  const ops = unlinkAccount(t);
+  const acct = id && (state.settings.accounts || []).find((a) => a.id === id);
+  const bal = acct && t.date >= (acct.asOf || '') ? txnDelta(t) : 0;
+  if (bal) ops.push(moveAccount(acct, bal));
+  const changes = { acct: acct ? acct.id : '', bal, ask: false };
+  Object.assign(t, changes);
+  ops.push({ type: 'update', id: t.id, changes });
+  return { ops, acct };
+}
+
+/** Links and saves; remembers the account as the default for the next spend. */
+function setAccount(t, id) {
+  const { ops, acct } = linkAccount(t, id);
+  save(...ops);
+  try { localStorage.setItem(LAST_ACCT_KEY, id || ''); } catch { /* private mode */ }
+  return acct;
+}
+
+const LAST_ACCT_KEY = 'daily-budget-last-acct';
+
+/** The account picked last time, if it still exists. */
+function lastAccount() {
+  let id = '';
+  try { id = localStorage.getItem(LAST_ACCT_KEY) || ''; } catch { /* private mode */ }
+  return (state.settings.accounts || []).some((a) => a.id === id) ? id : '';
+}
+
+const accountName = (t) => (t.acct && (state.settings.accounts || []).find((a) => a.id === t.acct)?.name) || '';
+const balanceNote = (a) => (a ? ` · ${a.name}: ${inr(a.balance)}` : '');
 
 /**
  * A payee matching your own name is money moved between your accounts, not a spend.
@@ -496,7 +568,7 @@ const titleCase = (s) => s.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase()
 
 /* ================= Mutations ================= */
 
-function addTxn({ name, category, amount, method = 'UPI', date = todayKey(), note = '', ref, kind = '' }) {
+function addTxn({ name, category, amount, method = 'UPI', date = todayKey(), note = '', ref, kind = '', acct, bal = 0, ask = false }) {
   amount = Number(amount);
   if (!name || !(amount > 0)) return false;
   const ops = [];
@@ -517,15 +589,19 @@ function addTxn({ name, category, amount, method = 'UPI', date = todayKey(), not
     ...(kind ? { kind } : {}),
     ...(note.trim() ? { note: note.trim() } : {}),
     ...(ref ? { ref } : {}),
+    ...(acct ? { acct, bal } : {}),
+    ...(ask ? { ask: true } : {}),
   };
   state.txns.push(txn);
   save(...ops, { type: 'add', txn });
-  return true;
+  return txn;
 }
 
 function deleteTxn(id) {
-  state.txns = state.txns.filter((t) => t.id !== id);
-  save({ type: 'delete', id });
+  const t = state.txns.find((x) => x.id === id);
+  const ops = t ? unlinkAccount(t) : [];
+  state.txns = state.txns.filter((x) => x.id !== id);
+  save(...ops, { type: 'delete', id });
 }
 
 function updateTxn(id, data) {
@@ -533,6 +609,8 @@ function updateTxn(id, data) {
   const amount = Number(data.amount);
   if (!t || !data.name?.trim() || !(amount > 0)) return false;
   const kind = data.kind || ''; // '' (not left out) so the server forgets an old kind too
+  const target = 'acct' in data ? data.acct : t.acct; // no picker (no accounts): keep the old link
+  const undo = unlinkAccount(t);
   const changes = {
     amount,
     name: data.name.trim(),
@@ -548,8 +626,8 @@ function updateTxn(id, data) {
     state.settings.startDate = changes.date;
     ops.push({ type: 'settings', settings: { startDate: changes.date } });
   }
-  save(...ops, { type: 'update', id, changes });
-  return true;
+  save(...undo, ...ops, { type: 'update', id, changes }, ...linkAccount(t, target).ops);
+  return t;
 }
 
 /* ================= Rendering ================= */
@@ -570,7 +648,7 @@ function render() {
 }
 
 function txnHtml(t, { withDate } = {}) {
-  const bits = [t.category + (t.category === 'Fixed' ? ' (set aside)' : ''), t.method, withDate && shortDate(t.date)].filter(Boolean);
+  const bits = [t.category + (t.category === 'Fixed' ? ' (set aside)' : ''), accountName(t) || t.method, withDate && shortDate(t.date)].filter(Boolean);
   return `
     <div class="txn editable" data-edit="${t.id}" role="button" tabindex="0" aria-label="Edit ${esc(t.name)}">
       <div class="ico">${icon(t.category, t.name, t.kind)}</div>
@@ -592,10 +670,30 @@ function bankTotalRow() {
       <span class="ico">${svgIcon('bank')}</span>
       <span class="meta">
         <span class="label">In your banks</span>
-        <span class="sub">${accounts.length ? esc(accounts.map((a) => a.name).join(' · ')) : 'Add your accounts and balances'}</span>
+        <span class="sub">${accounts.length ? accounts.map((a) => `${esc(a.name)} <b>${inr(a.balance)}</b>`).join(' · ') : 'Add your accounts and balances'}</span>
       </span>
       <span class="amt">${accounts.length ? inr(sumOf(accounts, (a) => a.balance)) : 'Add ›'}</span>
     </button>`;
+}
+
+/** Detected spends whose alert named no saved account: one tap says which account paid. */
+function askAccountCard() {
+  const accounts = state.settings.accounts || [];
+  const waiting = state.txns.filter((t) => t.ask && t.kind !== 'transfer').reverse();
+  if (!accounts.length || !waiting.length) return '';
+  return `
+    <section class="card ask-card">
+      <div class="label">Which account was this?</div>
+      ${waiting.slice(0, 5).map((t) => `
+        <div class="ask-row">
+          <div class="ask-what"><b>${esc(t.name)}</b> <span class="${t.kind === 'credit' ? 'green' : 'red'}">${t.kind === 'credit' ? '+' : '−'}${inr(t.amount)}</span> <span class="sub">${shortDate(t.date)}</span></div>
+          <div class="ask-btns">
+            ${accounts.map((a) => `<button class="chip" data-pay="${t.id}" data-acct="${a.id}">${esc(a.name)}</button>`).join('')}
+            <button class="chip" data-pay="${t.id}" data-acct="">Cash</button>
+          </div>
+        </div>`).join('')}
+      ${waiting.length > 5 ? `<p class="sub">+${waiting.length - 5} more after these</p>` : ''}
+    </section>`;
 }
 
 function renderToday() {
@@ -631,6 +729,8 @@ function renderToday() {
     </section>
 
     ${bankTotalRow()}
+
+    ${askAccountCard()}
 
     <button class="btn paste-cta" data-action="sms">📩 Paste SMS</button>
 
@@ -1674,6 +1774,7 @@ function openAddSheet(prefill = {}, { day } = {}) {
           </select>
         </div>`}
       </div>
+      ${accountPicker(prefill, kind, editing)}
       <div class="field">
         <label class="label" for="a-date">Date</label>
         <input id="a-date" name="date" type="date" value="${prefill.date || todayKey()}" max="${todayKey()}" />
@@ -1698,6 +1799,10 @@ function openAddSheet(prefill = {}, { day } = {}) {
     n.setSelectionRange(n.value.length, n.value.length);
   };
   form.querySelectorAll('[data-kind]').forEach((b) => b.addEventListener('click', () => switchTo(b.dataset.kind)));
+  // Paid in cash: not from a bank account.
+  $('#a-method', sheet)?.addEventListener('change', (e) => {
+    if (e.target.value === 'Cash' && $('#a-acct', sheet)) $('#a-acct', sheet).value = '';
+  });
   name.addEventListener('input', () => {
     // "Credit card bill" typed as a daily spend: that belongs with the big spends.
     if (!kind && CARD_BILL.test(name.value)) return switchTo('big', { category: 'Card bill' });
@@ -1707,6 +1812,21 @@ function openAddSheet(prefill = {}, { day } = {}) {
   });
   showSheet();
   if (!editing && !prefill.name) (prefill.amount ? name : $('#a-amount', sheet)).focus();
+}
+
+/** Which savings account a spend came out of (or money in went into); hidden with no accounts saved. */
+function accountPicker(prefill, kind, editing) {
+  const accounts = state.settings.accounts || [];
+  if (!accounts.length || kind === 'transfer') return '';
+  const sel = editing || 'acct' in prefill ? prefill.acct || '' : lastAccount();
+  return `
+      <div class="field">
+        <label class="label" for="a-acct">${kind === 'credit' ? 'Into account' : 'Paid from'}</label>
+        <select id="a-acct" name="acct">
+          ${accounts.map((a) => `<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)} · ${inr(a.balance)}</option>`).join('')}
+          <option value="" ${sel ? '' : 'selected'}>Cash / not from a bank</option>
+        </select>
+      </div>`;
 }
 
 /** Everything spent on one day, from a tap on the Month calendar. */
@@ -1775,9 +1895,12 @@ sheet.addEventListener('close', () => {
 function handleSheet(form, value) {
   const data = Object.fromEntries(new FormData(form));
   if (form.id === 'add-form') {
-    if (addTxn(data)) {
+    const { acct: picked, ...fields } = data;
+    const t = addTxn(fields);
+    if (t) {
+      const acct = picked !== undefined ? setAccount(t, picked) : null;
       const sign = data.kind === 'credit' ? '+' : '−';
-      toast(`${sign}${inr(Number(data.amount))} · ${data.name}${data.kind === 'big' ? ' · big spend, daily budget unchanged' : ''}`);
+      toast(`${sign}${inr(Number(data.amount))} · ${data.name}${data.kind === 'big' ? ' · big spend, daily budget unchanged' : ''}${balanceNote(acct)}`);
       render();
     }
   } else if (form.id === 'person-form') {
@@ -1796,7 +1919,10 @@ function handleSheet(form, value) {
     render();
   } else if (form.id === 'edit-form') {
     if (value === 'delete') { deleteTxn(form.dataset.id); toast('Spend deleted'); }
-    else if (updateTxn(form.dataset.id, data)) toast('Saved');
+    else {
+      const t = updateTxn(form.dataset.id, data);
+      if (t) toast(`Saved${balanceNote((state.settings.accounts || []).find((a) => a.id === t.acct))}`);
+    }
     render();
   } else if (form.id === 'sms-form') {
     const results = splitMessages(data.sms).map(importMessage);
@@ -1813,6 +1939,7 @@ function handleSheet(form, value) {
     if (moves.length) parts.push(`Moved between your own accounts, not counted: ${moves.map((p) => inr(p.amount)).join(', ')}`);
     // Name the duplicates, so a stale clipboard (the previous message pasted again) is easy to spot.
     if (dups.length) parts.push(`Already added: ${dups.map((p) => `${p.name} ${inr(p.amount)} (${shortDate(p.date)})`).join(', ')}`);
+    if (added.some((p) => p.ask)) parts.push('Pick which account paid on the Today tab');
     if (!parts.length) parts.push("No debit or credit found in that. Paste the whole message, including the “Sent Rs” / “debited” / “credited” line.");
     toast(parts.join(' · '), dups.length || moves.length || !added.length ? 6000 : undefined);
     render();
@@ -1953,6 +2080,13 @@ view.addEventListener('click', async (e) => {
   if (fixedRow) return openFixedSheet((state.settings.fixed || []).find((f) => f.id === fixedRow.dataset.fixed));
   const acct = e.target.closest('[data-account]');
   if (acct) return openAccountSheet((state.settings.accounts || []).find((a) => a.id === acct.dataset.account));
+  const pay = e.target.closest('[data-pay]');
+  if (pay) {
+    const txn = state.txns.find((x) => x.id === pay.dataset.pay);
+    const acct = txn && setAccount(txn, pay.dataset.acct);
+    if (txn) toast(acct ? `${txn.name} · ${acct.name}: ${inr(acct.balance)}` : `${txn.name} · paid in cash`);
+    return render();
+  }
   const inv = e.target.closest('[data-invest]');
   if (inv) return openInvestSheet((state.settings.investments || []).find((i) => i.id === inv.dataset.invest));
   const cell = e.target.closest('[data-day]');
@@ -1960,8 +2094,10 @@ view.addEventListener('click', async (e) => {
   if (!t) return;
   if (t.dataset.quick) {
     const q = QUICK_ADD[t.dataset.quick];
-    addTxn(q);
-    toast(`−${inr(q.amount)} · ${q.name}`);
+    const id = lastAccount();
+    const txn = addTxn({ ...q, ask: !id && (state.settings.accounts || []).length > 0 });
+    const acct = id ? setAccount(txn, id) : null;
+    toast(`−${inr(q.amount)} · ${q.name}${balanceNote(acct)}`);
     render();
   } else if (t.dataset.del) {
     deleteTxn(t.dataset.del);
