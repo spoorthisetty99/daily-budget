@@ -101,6 +101,10 @@ Logging in gives the phone that person's app key, which their automations also u
 sees **Settings → People → Add a person**: pick a username and password, and they can log in straight away with an
 empty budget. Only admins can add people.
 
+**Changing passwords:** everyone can change their own in **Settings → Account → Change password** (it asks for the current
+one). If someone forgets theirs, the admin taps **New password** next to their name under **Settings → People**. Phones stay
+logged in and automations keep working, since the app key doesn't change.
+
 **Backups:** every save also keeps that day's copy in `data/backups/<name>/<date>.json`; the last 14 days are kept.
 To undo a mistake, copy an older day's file over `data/<name>.json` (PythonAnywhere: Files tab or a Bash console).
 **Settings → Backups → Download a backup** saves your own copy on the phone.

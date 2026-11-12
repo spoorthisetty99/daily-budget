@@ -16,6 +16,8 @@ API (used by the app and the phone automations):
   POST /api/login     {"username", "password"} → {"user", "key"}
   GET  /api/me        {"user", "admin"}
   GET  /api/users     (admin) the logins;  POST {"username", "password"} adds one with empty data
+  POST /api/password  {"current", "new"} changes your own password; an admin can send {"username", "new"}
+                      to set someone else's. The app key (and so every automation) stays the same.
 
 Each data file is also copied once a day to backups/<name>/<date>.json (the last 14 days are kept).
 
@@ -139,6 +141,18 @@ def user_file(name):
 
 def hash_password(password, salt):
     return hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 200_000).hex()
+
+
+def set_password(name, password):
+    """New salt and hash for an existing login; its app key stays, so automations keep working. Raises ValueError."""
+    if len(password) < 8:
+        raise ValueError('The password needs at least 8 characters.')
+    accounts = users()
+    if name not in accounts:
+        raise ValueError(f'No user called {name}.')
+    salt = secrets.token_hex(16)
+    accounts[name].update(salt=salt, hash=hash_password(password, salt))
+    write_json(USERS, accounts)
 
 
 def create_user(name, password, source=None):
@@ -606,6 +620,33 @@ TYPES = {  # explicit, since Windows' registry can map .js to text/plain
 }
 
 
+def change_password(name, raw):
+    """POST /api/password: your own (with the current password), or an admin setting someone else's."""
+    if not name:
+        return 400, {'error': 'There are no logins to change a password for.'}
+    try:
+        d = json.loads(raw)
+        target = str(d.get('username') or name).strip().lower()
+        new = str(d['new'])
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return 400, {'error': 'Bad request'}
+    with LOCK:
+        accounts = users()
+        if target != name:
+            if not is_admin(name, accounts):
+                return 403, {'error': "Only the admin can change someone else's password."}
+        else:
+            u = accounts[name]
+            if not hmac.compare_digest(hash_password(str(d.get('current') or ''), u['salt']), u['hash']):
+                time.sleep(1)  # slows down password guessing
+                return 401, {'error': 'Your current password is wrong.'}
+        try:
+            set_password(target, new)
+        except ValueError as e:
+            return 400, {'error': str(e)}
+    return 200, {'user': target}
+
+
 def people(method, name, raw):
     """GET /api/users lists logins; POST {"username", "password"} adds one. Admins only."""
     accounts = users()
@@ -644,6 +685,9 @@ def respond(method, target, headers, body):
             return 200, JSON, json.dumps({'user': name, 'admin': bool(name) and is_admin(name, users())}).encode()
         if path == '/api/users':
             return people(method, name, raw)
+        if method == 'POST' and path == '/api/password':
+            status, out = change_password(name, raw)
+            return status, JSON, json.dumps(out).encode()
         if method == 'GET' and path == '/api/state':
             return 200, JSON, json.dumps(load(), ensure_ascii=False).encode()
         if method == 'GET' and path == '/api/summary':
@@ -759,9 +803,10 @@ def cli(args):
     if cmd == 'passwd':
         if name not in accounts:
             return print(f'No user called {name}.')
-        salt = secrets.token_hex(16)
-        accounts[name].update(salt=salt, hash=hash_password(ask_password(), salt))
-        write_json(USERS, accounts)
+        try:
+            set_password(name, ask_password())
+        except ValueError as e:
+            return print(e)
         return print(f'Password changed for {name}.')
     if name in accounts:
         return print(f'{name} already exists. To change the password: python server.py passwd {name}')

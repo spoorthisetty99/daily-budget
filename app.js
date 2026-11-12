@@ -1437,6 +1437,7 @@ function peopleSection() {
           <div class="txn">
             <div class="ico">${svgIcon('dot')}</div>
             <div class="meta"><div class="name">${esc(p.name)}</div><div class="cat">${p.admin ? 'admin · can add people' : 'own login and data'}</div></div>
+            ${p.name === userName ? '' : `<button class="btn ghost small" data-reset="${esc(p.name)}">New password</button>`}
           </div>`).join('') : '<div class="empty" style="padding:8px 0">Loading…</div>'}
       </div>
       <button class="btn ghost" data-action="add-person">+ Add a person</button>
@@ -1487,6 +1488,55 @@ async function addPerson(data) {
   people = out.users;
   render();
   toast(`${username} can now log in at ${location.host}`, 6000);
+}
+
+/** Your own password (asks for the current one), or, for the admin, a new one for someone who forgot theirs. */
+function openPasswordSheet(forName) {
+  const own = !forName;
+  sheet.innerHTML = `
+    <form method="dialog" id="password-form" data-user="${esc(forName || '')}">
+      <h2>${own ? 'Change your password' : `New password for ${esc(forName)}`}</h2>
+      <p class="hint">${own
+        ? 'Your phones stay logged in, and your bank-alert automations keep working.'
+        : "For when they've forgotten theirs. Send them the new one; their phones and automations keep working."}</p>
+      ${own ? `
+      <div class="field">
+        <label class="label" for="pw-current">Current password</label>
+        <input id="pw-current" name="current" type="password" autocomplete="current-password" required />
+      </div>` : ''}
+      <div class="field">
+        <label class="label" for="pw-new">New password</label>
+        <input id="pw-new" name="new" type="${own ? 'password' : 'text'}" minlength="8" autocomplete="new-password" autocapitalize="none" autocorrect="off" spellcheck="false" required />
+        <small class="hint">At least 8 characters.${own ? '' : ' Shown here so you can send it to them.'}</small>
+      </div>
+      ${own ? `
+      <div class="field">
+        <label class="label" for="pw-again">New password again</label>
+        <input id="pw-again" name="again" type="password" minlength="8" autocomplete="new-password" required />
+      </div>` : ''}
+      <button class="btn" value="save">Save password</button>
+      <button class="btn ghost" value="cancel" formnovalidate>Cancel</button>
+    </form>`;
+  showSheet();
+  $(own ? '#pw-current' : '#pw-new', sheet).focus();
+}
+
+async function changePassword(form, data) {
+  const forName = form.dataset.user;
+  if (!forName && data.new !== data.again) return toast("The two new passwords don't match", 4000);
+  let res;
+  try {
+    res = await api('api/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(forName ? { username: forName, new: data.new } : { current: data.current, new: data.new }),
+    });
+  } catch {
+    return toast("Can't reach the server right now");
+  }
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) return toast(out.error || "Couldn't change the password", 5000);
+  toast(forName ? `${forName} can now log in with the new password` : 'Password changed', 5000);
 }
 
 /** Saves this person's whole budget as a JSON file on the phone. */
@@ -1581,7 +1631,8 @@ function renderSettings() {
       <div class="label section-title">Account</div>
       <section class="card">
         <p class="sub" style="margin-top:0">Logged in as <b>${esc(userName)}</b>. Logging out removes your data from this phone only; it stays safe on the server.</p>
-        <button class="btn ghost" data-action="sign-out">Log out</button>
+        <button class="btn ghost" data-action="password">Change password</button>
+        <button class="btn ghost" data-action="sign-out" style="margin-top:10px">Log out</button>
       </section>` : ''}
     <p class="sub" style="text-align:center">${!serverMode ? 'Everything stays on this device (localStorage).'
       : userName ? 'Your data is stored on the server, under your login, and shared by every device you log in on.'
@@ -1906,6 +1957,8 @@ function handleSheet(form, value) {
     }
   } else if (form.id === 'person-form') {
     addPerson(data);
+  } else if (form.id === 'password-form') {
+    changePassword(form, data);
   } else if (form.id === 'account-form') {
     const removed = value === 'delete';
     if (saveListItem('accounts', form.dataset.id, removed, () => accountFrom(data))) toast(removed ? 'Account removed' : 'Balance saved');
@@ -2117,6 +2170,8 @@ view.addEventListener('click', async (e) => {
   else if (t.dataset.action === 'export') exportCsv();
   else if (t.dataset.action === 'add-fixed') openFixedSheet();
   else if (t.dataset.action === 'add-person') openPersonSheet();
+  else if (t.dataset.action === 'password') openPasswordSheet();
+  else if (t.dataset.reset) openPasswordSheet(t.dataset.reset);
   else if (t.dataset.action === 'backup') downloadBackup();
   else if (t.dataset.action === 'sign-out') {
     if (confirm('Log out on this phone? Your data stays safe on the server.')) signOut();
