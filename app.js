@@ -1818,7 +1818,8 @@ function openAddSheet(prefill = {}, { day } = {}) {
 function accountPicker(prefill, kind, editing) {
   const accounts = state.settings.accounts || [];
   if (!accounts.length || kind === 'transfer') return '';
-  const sel = editing || 'acct' in prefill ? prefill.acct || '' : lastAccount();
+  // A new spend starts on the account used last, else the first one: a bank, not cash.
+  const sel = editing || 'acct' in prefill ? prefill.acct || '' : lastAccount() || accounts[0].id;
   return `
       <div class="field">
         <label class="label" for="a-acct">${kind === 'credit' ? 'Into account' : 'Paid from'}</label>
