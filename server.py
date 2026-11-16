@@ -304,13 +304,15 @@ def summary_text():
 A = re.I | re.A
 DEBIT = re.compile(r'debited|paid|spent|sent|withdrawn|purchase|txn|payment of', re.I)
 CREDIT = re.compile(r'credited|received|deposited|refund', re.I)
-# The account's last digits: "A/C *3344", "A/c no. XX7788", "Account Number: XX7788", "account ending in 3344"
-ACCOUNT = re.compile(r"\b(?:a/c|acct|account)(?:\s*(?:no|number)\.?)?\s*:?\s*(?:ending\s+(?:with\s+|in\s+)?|[x*]+)(\d{3,6})\b", A)
+# The account's last digits: "A/C *3344", "A/c no. XX7788", "account ending in 3344", "from account 3344"
+ACCOUNT = re.compile(r"\b(?:a/c|acct|account)(?:\s*(?:no|number)\.?)?\s*:?\s*(?:ending\s+(?:with\s+|in\s+)?|[x*]+)?(\d{3,18})\b", A)
+# ...or masked with no "A/c" before it ("HDFC Bank XX7788"), as long as it isn't a card's
+MASKED = re.compile(r'[x*]{2,}(\d{3,6})\b', A)
 FROM = re.compile(r"\b(?:from|by)\s+(?:vpa\s+)?(?:(?:neft|imps|rtgs|upi)[-/ ]+)?([A-Za-z][\w&' .\-]{1,40}?)"
                   r"(?=\s+(?:on|via|ref|upi|for|to|avl|a/c)\b|[.,(]|@|$)", A)
 CREDIT_SOURCES = [(r'salary|payroll|\bsal\b', 'Salary'), (r'refund|reversal|cashback', 'Refund'),
                   (r'interest|\bint\.? ?pd', 'Interest'), (r'bonus', 'Bonus')]
-AMOUNT = re.compile(r'(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)', A)
+AMOUNT = re.compile(r'(?:rs\.?|inr|₹)\s*:?\s*([\d,]+(?:\.\d{1,2})?)', A)
 BALANCE_BEFORE = re.compile(r'(bal(ance)?|limit|avl\.?|available)\s*(is|:)?\s*$', A)
 VPA = re.compile(r'(?:vpa|upi id)\s*:?\s*([\w.\-]+)@[\w.]+', A)
 TO = re.compile(r"\b(?:to|at|towards)\s+(?:vpa\s+)?([A-Za-z][\w&' .\-]{1,40}?)"
@@ -414,7 +416,8 @@ def parse_sms(text, fixed=()):
         return None
     if amount <= 0:
         return None
-    acct = ACCOUNT.search(text)
+    acct = ACCOUNT.search(text) or next((m for m in MASKED.finditer(text)
+                                         if not re.search('card', text[max(0, m.start() - 15):m.start()], A)), None)
     ref = REF.search(text)
     base = {
         **({'ref': ref[1]} if ref else {}),

@@ -352,15 +352,17 @@ function parseSms(text) {
   // A card bill's "payment received" comes from the card, not from a savings account.
   if (!dir || (dir === 'in' && CARD_BILL.test(text))) return null;
   // Skip "Avl Bal Rs 12,000" / "credit limit INR 50,000" — take the first amount that isn't a balance.
-  const amounts = [...text.matchAll(/(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)/gi)]
+  const amounts = [...text.matchAll(/(?:rs\.?|inr|₹)\s*:?\s*([\d,]+(?:\.\d{1,2})?)/gi)]
     .filter((m) => !/(bal(ance)?|limit|avl\.?|available)\s*(is|:)?\s*$/i.test(text.slice(Math.max(0, m.index - 20), m.index)));
   if (!amounts.length) return null;
   const amount = parseFloat(amounts[0][1].replace(/,/g, ''));
   if (!(amount > 0)) return null;
   // The UPI reference is the same in the SMS and the email for one payment, so it catches cross-channel duplicates.
   const ref = text.match(/(?:\bref(?:erence)?(?:\s*no)?\.?|\brrn|\bupi(?:\/p2[am])?)[\s:\/#.-]*(\d{12})\b/i)?.[1];
-  // The account's last digits: "A/C *3344", "A/c no. XX7788", "Account Number: XX7788", "account ending in 3344"
-  const acct = text.match(/\b(?:a\/c|acct|account)(?:\s*(?:no|number)\.?)?\s*:?\s*(?:ending\s+(?:with\s+|in\s+)?|[x*]+)(\d{3,6})\b/i)?.[1];
+  // The account's last digits: "A/C *3344", "A/c no. XX7788", "account ending in 3344", "from account 3344",
+  // or masked with no "A/c" before it ("HDFC Bank XX7788") as long as it isn't a card's.
+  const acct = text.match(/\b(?:a\/c|acct|account)(?:\s*(?:no|number)\.?)?\s*:?\s*(?:ending\s+(?:with\s+|in\s+)?|[x*]+)?(\d{3,18})\b/i)?.[1]
+    || [...text.matchAll(/[x*]{2,}(\d{3,6})\b/gi)].find((m) => !/card/i.test(text.slice(Math.max(0, m.index - 15), m.index)))?.[1];
   const base = { ...(ref ? { ref } : {}), ...(acct ? { acct } : {}), dir, amount, date: dateInText(text) };
   const tidy = (s) => s.replace(/[._\-]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 22);
   if (dir === 'in') {
@@ -477,12 +479,10 @@ function remember(key) {
  * share a UPI ref). Alerts dated before the day you typed the balance are already in it.
  */
 function moveBalance(p, fp) {
-  const accounts = state.settings.accounts || [];
   const acct = accountByDigits(p.acct);
   const key = `bal:${p.ref || fp}:${p.dir}`;
   if (!acct || p.date < (acct.asOf || '') || state.seenSms.includes(key)) return null;
-  acct.balance = Math.round((Number(acct.balance) + (p.dir === 'in' ? p.amount : -p.amount)) * 100) / 100;
-  save({ type: 'settings', settings: { accounts } });
+  save(moveAccount(acct, p.dir === 'in' ? p.amount : -p.amount));
   remember(key);
   return acct;
 }
