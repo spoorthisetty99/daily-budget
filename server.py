@@ -305,7 +305,7 @@ A = re.I | re.A
 DEBIT = re.compile(r'debited|paid|spent|sent|withdrawn|purchase|txn|payment of', re.I)
 CREDIT = re.compile(r'credited|received|deposited|refund', re.I)
 # The account's last digits: "A/C *3344", "A/c no. XX7788", "account ending in 3344", "from account 3344"
-ACCOUNT = re.compile(r"\b(?:a/c|acct|account)(?:\s*(?:no|number)\.?)?\s*:?\s*(?:ending\s+(?:with\s+|in\s+)?|[x*]+)?(\d{3,18})\b", A)
+ACCOUNT = re.compile(r"\b(?:a/c|acct|account|ac\b)(?:\s*(?:no|number)\.?)?\s*:?\s*(?:ending\s+(?:with\s+|in\s+)?|[x*]+)?(\d{3,18})\b", A)
 # ...or masked with no "A/c" before it ("HDFC Bank XX7788"), as long as it isn't a card's
 MASKED = re.compile(r'[x*]{2,}(\d{3,6})\b', A)
 FROM = re.compile(r"\b(?:from|by)\s+(?:vpa\s+)?(?:(?:neft|imps|rtgs|upi)[-/ ]+)?([A-Za-z][\w&' .\-]{1,40}?)"
@@ -315,7 +315,7 @@ CREDIT_SOURCES = [(r'salary|payroll|\bsal\b', 'Salary'), (r'refund|reversal|cash
 AMOUNT = re.compile(r'(?:rs\.?|inr|₹)\s*:?\s*([\d,]+(?:\.\d{1,2})?)', A)
 BALANCE_BEFORE = re.compile(r'(bal(ance)?|limit|avl\.?|available)\s*(is|:)?\s*$', A)
 VPA = re.compile(r'(?:vpa|upi id)\s*:?\s*([\w.\-]+)@[\w.]+', A)
-TO = re.compile(r"\b(?:to|at|towards)\s+(?:vpa\s+)?([A-Za-z][\w&' .\-]{1,40}?)"
+TO = re.compile(r"\b(?:to|at|towards)(?:\s*:\s*|\s+)(?:vpa\s+)?([A-Za-z][\w&' .\-]{1,40}?)"
                 r"(?=\s+(?:on|via|ref|upi|using|from|for|avl|a/c|\.|$)|[.,(]|@)", A)
 UPI_NAME = re.compile(r"\bupi/p2[am]/\d+/([A-Za-z][A-Za-z&' .]{1,40}?)(?=\s*/|\s+not\b|\s+avl|[.,]|$)", A)
 REF = re.compile(r"(?:\bref(?:erence)?(?:\s*no)?\.?|\brrn|\bupi(?:/p2[am])?)[\s:/#.-]*(\d{12})\b", A)
@@ -382,7 +382,7 @@ def date_in_text(text):
     m = re.search(r'\b(20\d\d)-(\d\d)-(\d\d)\b', text, re.A)
     if m:
         return try_key(int(m[1]), int(m[2]), int(m[3])) or t
-    m = re.search(r'\b(\d{1,2})[-/ ]([A-Za-z]{3})[a-z]*[-/ ,]+(\d{2,4})\b', text, re.A)
+    m = re.search(r'\b(\d{1,2})[-/ ]?([A-Za-z]{3})[a-z]*[-/ ,]*(\d{2,4})\b', text, re.A)
     if m and m[2].lower() in MONTHS:
         return try_key(yr(m[3]), MONTHS.index(m[2].lower()) + 1, int(m[1])) or t
     m = re.search(r'\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})\b', text, re.A)
@@ -433,6 +433,8 @@ def parse_sms(text, fixed=()):
         return {'kind': 'credit', **base, 'name': title_case(name), 'method': '', 'category': source}
     hit = TO.search(text) or UPI_NAME.search(text) or INFO.search(text) or VPA.search(text)
     name = hit[1] if hit else ''
+    # "zeptomarketplac895229.rzp" -> "zeptomarketplac": drop order numbers and the payment gateway's tag.
+    name = re.sub(r'[._-](?:rzp|razorpay|payu|cashfree|billdesk|ccavenue)\b', '', re.sub(r'\d{3,}', '', name), flags=re.I)
     name = re.sub(r'\s+', ' ', re.sub(r'[._\-]+', ' ', name)).strip() or 'UPI payment'
     name = name[:22]
     method = 'Card' if re.search('card', text, re.I) else 'Cash' if re.search('atm|withdrawn', text, re.I) else 'UPI'

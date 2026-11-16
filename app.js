@@ -361,7 +361,7 @@ function parseSms(text) {
   const ref = text.match(/(?:\bref(?:erence)?(?:\s*no)?\.?|\brrn|\bupi(?:\/p2[am])?)[\s:\/#.-]*(\d{12})\b/i)?.[1];
   // The account's last digits: "A/C *3344", "A/c no. XX7788", "account ending in 3344", "from account 3344",
   // or masked with no "A/c" before it ("HDFC Bank XX7788") as long as it isn't a card's.
-  const acct = text.match(/\b(?:a\/c|acct|account)(?:\s*(?:no|number)\.?)?\s*:?\s*(?:ending\s+(?:with\s+|in\s+)?|[x*]+)?(\d{3,18})\b/i)?.[1]
+  const acct = text.match(/\b(?:a\/c|acct|account|ac\b)(?:\s*(?:no|number)\.?)?\s*:?\s*(?:ending\s+(?:with\s+|in\s+)?|[x*]+)?(\d{3,18})\b/i)?.[1]
     || [...text.matchAll(/[x*]{2,}(\d{3,6})\b/gi)].find((m) => !/card/i.test(text.slice(Math.max(0, m.index - 15), m.index)))?.[1];
   const base = { ...(ref ? { ref } : {}), ...(acct ? { acct } : {}), dir, amount, date: dateInText(text) };
   const tidy = (s) => s.replace(/[._\-]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 22);
@@ -374,14 +374,15 @@ function parseSms(text) {
   }
   let name = '';
   const vpa = text.match(VPA);
-  const to = text.match(/\b(?:to|at|towards)\s+(?:vpa\s+)?([A-Za-z][\w&' .\-]{1,40}?)(?=\s+(?:on|via|ref|upi|using|from|for|avl|a\/c|\.|$)|[.,(]|@)/i);
+  const to = text.match(/\b(?:to|at|towards)(?:\s*:\s*|\s+)(?:vpa\s+)?([A-Za-z][\w&' .\-]{1,40}?)(?=\s+(?:on|via|ref|upi|using|from|for|avl|a\/c|\.|$)|[.,(]|@)/i);
   const upi = text.match(UPI_NAME);
   const info = text.match(INFO);
   if (to) name = to[1];
   else if (upi) name = upi[1];
   else if (info) name = info[1];
   else if (vpa) name = vpa[1];
-  name = tidy(name) || 'UPI payment';
+  // "zeptomarketplac895229.rzp" → "zeptomarketplac": drop order numbers and the payment gateway's tag.
+  name = tidy(name.replace(/\d{3,}/g, '').replace(/[._-](?:rzp|razorpay|payu|cashfree|billdesk|ccavenue)\b/gi, '')) || 'UPI payment';
   const method = /card/i.test(text) ? 'Card' : /atm|withdrawn/i.test(text) ? 'Cash' : 'UPI';
   // Paying a credit card is a big spend, not a daily one: its purchases were already counted.
   const bill = CARD_BILL.test(text);
@@ -412,7 +413,7 @@ function dateInText(text) {
   };
   let m;
   if ((m = text.match(/\b(20\d\d)-(\d\d)-(\d\d)\b/))) return tryKey(+m[1], +m[2], +m[3]) || today;
-  if ((m = text.match(/\b(\d{1,2})[-\/ ]([A-Za-z]{3})[a-z]*[-\/ ,]+(\d{2,4})\b/))) {
+  if ((m = text.match(/\b(\d{1,2})[-\/ ]?([A-Za-z]{3})[a-z]*[-\/ ,]*(\d{2,4})\b/))) {
     const mon = MONTHS.indexOf(m[2].toLowerCase()) + 1;
     if (mon) return tryKey(yr(m[3]), mon, +m[1]) || today;
   }
@@ -551,7 +552,9 @@ function lastAccount() {
 }
 
 const accountName = (t) => (t.acct && (state.settings.accounts || []).find((a) => a.id === t.acct)?.name) || '';
-const balanceNote = (a) => (a ? ` · ${a.name}: ${inr(a.balance)}` : '');
+const balanceNote = (a, t) => (!a ? ''
+  : t && !t.bal && t.date < (a.asOf || '') ? ` · already in ${a.name}'s balance (set ${shortDate(a.asOf)})`
+  : ` · ${a.name}: ${inr(a.balance)}`);
 
 /**
  * A payee matching your own name is money moved between your accounts, not a spend.
@@ -1220,7 +1223,7 @@ function renderMoney() {
         ${accounts.map((a) => `
           <div class="txn editable" data-account="${a.id}" role="button" tabindex="0" aria-label="Update ${esc(a.name)}">
             <div class="ico">${svgIcon('bank')}</div>
-            <div class="meta"><div class="name">${esc(a.name)}</div><div class="cat">${a.digits ? `XX${esc(a.digits)} · auto-updates` : `set ${shortDate(a.asOf)} · tap to add last digits`}</div></div>
+            <div class="meta"><div class="name">${esc(a.name)}</div><div class="cat">${a.digits ? `XX${esc(a.digits)} · balance set ${shortDate(a.asOf)} · auto-updates` : `set ${shortDate(a.asOf)} · tap to add last digits`}</div></div>
             <div class="amt plain">${inr(a.balance)}</div>
           </div>`).join('') || '<div class="empty" style="padding:8px 0">Add each bank account and its balance, then update it whenever you check your bank app.</div>'}
       </div>
@@ -1853,7 +1856,21 @@ function openAddSheet(prefill = {}, { day } = {}) {
   // Paid in cash: not from a bank account.
   $('#a-method', sheet)?.addEventListener('change', (e) => {
     if (e.target.value === 'Cash' && $('#a-acct', sheet)) $('#a-acct', sheet).value = '';
+    showAccountHint();
   });
+  // Says up front when a balance won't move: it was typed after this day, so it already counts the spend.
+  const showAccountHint = () => {
+    const hint = $('#a-acct-hint', sheet);
+    if (!hint) return;
+    const a = (state.settings.accounts || []).find((x) => x.id === $('#a-acct', sheet).value);
+    const day = $('#a-date', sheet).value || todayKey();
+    hint.textContent = a && day < (a.asOf || '')
+      ? `${a.name}'s balance was set on ${shortDate(a.asOf)}, so it already includes this. It won't be taken again.`
+      : '';
+  };
+  $('#a-acct', sheet)?.addEventListener('change', showAccountHint);
+  $('#a-date', sheet).addEventListener('change', showAccountHint);
+  showAccountHint();
   name.addEventListener('input', () => {
     // "Credit card bill" typed as a daily spend: that belongs with the big spends.
     if (!kind && CARD_BILL.test(name.value)) return switchTo('big', { category: 'Card bill' });
@@ -1878,6 +1895,7 @@ function accountPicker(prefill, kind, editing) {
           ${accounts.map((a) => `<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)} · ${inr(a.balance)}</option>`).join('')}
           <option value="" ${sel ? '' : 'selected'}>Cash / not from a bank</option>
         </select>
+        <small class="hint" id="a-acct-hint"></small>
       </div>`;
 }
 
@@ -1952,7 +1970,7 @@ function handleSheet(form, value) {
     if (t) {
       const acct = picked !== undefined ? setAccount(t, picked) : null;
       const sign = data.kind === 'credit' ? '+' : '−';
-      toast(`${sign}${inr(Number(data.amount))} · ${data.name}${data.kind === 'big' ? ' · big spend, daily budget unchanged' : ''}${balanceNote(acct)}`);
+      toast(`${sign}${inr(Number(data.amount))} · ${data.name}${data.kind === 'big' ? ' · big spend, daily budget unchanged' : ''}${balanceNote(acct, t)}`);
       render();
     }
   } else if (form.id === 'person-form') {
@@ -1975,7 +1993,7 @@ function handleSheet(form, value) {
     if (value === 'delete') { deleteTxn(form.dataset.id); toast('Spend deleted'); }
     else {
       const t = updateTxn(form.dataset.id, data);
-      if (t) toast(`Saved${balanceNote((state.settings.accounts || []).find((a) => a.id === t.acct))}`);
+      if (t) toast(`Saved${balanceNote((state.settings.accounts || []).find((a) => a.id === t.acct), t)}`);
     }
     render();
   } else if (form.id === 'sms-form') {
@@ -2151,7 +2169,7 @@ view.addEventListener('click', async (e) => {
     const id = lastAccount();
     const txn = addTxn({ ...q, ask: !id && (state.settings.accounts || []).length > 0 });
     const acct = id ? setAccount(txn, id) : null;
-    toast(`−${inr(q.amount)} · ${q.name}${balanceNote(acct)}`);
+    toast(`−${inr(q.amount)} · ${q.name}${balanceNote(acct, txn)}`);
     render();
   } else if (t.dataset.del) {
     deleteTxn(t.dataset.del);
