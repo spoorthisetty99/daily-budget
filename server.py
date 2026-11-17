@@ -53,6 +53,7 @@ KEY = os.environ.get('BUDGET_KEY', '')  # single-user mode: required once the ap
 USERS = os.environ.get('BUDGET_USERS') or os.path.join(ROOT, 'users.json')
 DATA_DIR = os.environ.get('BUDGET_DATA_DIR') or os.path.join(ROOT, 'data')
 LOCK = threading.Lock()
+SERVER_VERSION = 3  # 3: understands {type: 'balance'} ops. app.js warns when the running server is older.
 CURRENT = contextvars.ContextVar('data_file', default=DATA)  # the signed-in user's file, per request
 
 # Hosts usually run on UTC; spends must land on the right Indian day.
@@ -677,7 +678,8 @@ def respond(method, target, headers, body):
     if path.startswith('/api/'):
         raw = body.decode('utf-8', 'replace')
         if path == '/api/auth':
-            return 200, JSON, json.dumps({'users': bool(users())}).encode()
+            # `version` lets the app notice a server that was updated with git pull but not restarted.
+            return 200, JSON, json.dumps({'users': bool(users()), 'version': SERVER_VERSION}).encode()
         if method == 'POST' and path == '/api/login':
             status, out = login(raw)
             return status, JSON, json.dumps(out).encode()

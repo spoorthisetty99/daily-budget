@@ -74,6 +74,28 @@ async function checkLoginMode() {
   try { loginMode = !!(await (await fetch('api/auth', { cache: 'no-store' })).json()).users; } catch { /* offline */ }
 }
 
+// The server code the app needs. After a `git pull`, PythonAnywhere keeps running the old server.py until
+// Reload is pressed, and an old server silently ignores balance changes, so the app says so instead.
+const NEEDS_SERVER = 3;
+let serverOld = false;
+async function checkServerVersion() {
+  try { serverOld = ((await (await fetch('api/auth', { cache: 'no-store' })).json()).version || 0) < NEEDS_SERVER; } catch { /* offline */ }
+}
+
+function oldServerCard() {
+  if (!serverMode || !serverOld) return '';
+  return `
+    <section class="card ask-card">
+      <div class="label">Bank balances can't update yet</div>
+      <p class="sub" style="margin:4px 0 0">The server is still running its old code, so it ignores balance changes.
+      On PythonAnywhere, open the <b>Web</b> tab and press <b>Reload</b>, then close and reopen this app.
+      After that, type each bank's current balance once on the Money tab.</p>
+    </section>`;
+}
+
+// Bumped on every save: a server reply that left before the save doesn't know about it, so it isn't adopted.
+let saveSeq = 0;
+
 /** Forgets this device's copy of someone's data, so the next person starts from their own. */
 function forgetLocalData() {
   localStorage.removeItem(STORE_KEY);
@@ -97,6 +119,7 @@ const api = (path, opts = {}) =>
   fetch(path, { ...opts, headers: { ...(opts.headers || {}), ...(appKey ? { 'X-Budget-Key': appKey } : {}) } });
 
 function queueOps(ops) {
+  saveSeq++;
   outbox.push(...ops);
   saveOutbox();
   queueMicrotask(flush); // batches everything saved in the same tick
@@ -121,6 +144,7 @@ async function flush() {
   if (!serverMode || flushing || !outbox.length) return;
   flushing = true;
   const ops = outbox.splice(0);
+  const seq = saveSeq;
   try {
     const res = await api('api/ops', {
       method: 'POST',
@@ -129,7 +153,8 @@ async function flush() {
     });
     if (res.status === 401) { needKey = true; render(); }
     if (!res.ok) throw new Error(res.status);
-    if (adopt(await res.json()) && !isEditing()) render();
+    const remote = await res.json();
+    if (seq === saveSeq && adopt(remote) && !isEditing()) render(); // newer saves: their own reply follows
   } catch {
     outbox.unshift(...ops);
     if (!needKey) toast('Saved on this phone. It will sync when the server is reachable.');
@@ -137,6 +162,7 @@ async function flush() {
     saveOutbox();
     flushing = false;
   }
+  if (serverMode && !needKey && outbox.length && seq !== saveSeq) flush(); // saved while this was sending
 }
 
 // Don't redraw under someone typing (the setup screen doesn't count: synced data replaces it).
@@ -169,7 +195,7 @@ async function connect() {
   }
   const remote = await res.json();
   serverMode = true;
-  await checkMe();
+  await Promise.all([checkMe(), checkServerVersion()]);
   if (!remote.settings?.income && state.settings.income) {
     outbox.unshift({ type: 'replace', state: shareable(state) });
   } else if (!outbox.length) {
@@ -184,10 +210,13 @@ async function refresh() {
   if (!serverMode) return connect();
   await flush();
   if (outbox.length) return;
+  const seq = saveSeq;
   try {
     const res = await api('api/state', { cache: 'no-store' });
     if (res.status === 401) { needKey = true; serverMode = false; await checkLoginMode(); return render(); }
-    if (res.ok && adopt(await res.json()) && !isEditing()) render();
+    if (!res.ok) return;
+    const remote = await res.json();
+    if (seq === saveSeq && adopt(remote) && !isEditing()) render(); // a save while this was in flight wins
   } catch { /* offline */ }
 }
 
@@ -733,6 +762,7 @@ function renderToday() {
 
     ${bankTotalRow()}
 
+    ${oldServerCard()}
     ${askAccountCard()}
 
     <button class="btn paste-cta" data-action="sms">📩 Paste SMS</button>
